@@ -204,7 +204,7 @@ Source    | URL from where the app can be downloaded (only for install)
 #### Request
 
 ```http
-POST /apps/emails?Source=git://github.com/cozy/cozy-emails HTTP/1.1
+POST /apps/emails?Source=git://github.com/cozy/cozy-emails.git HTTP/1.1
 Accept: application/vnd.api+json
 ```
 
