@@ -1,17 +1,20 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"net/url"
-	"path"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"text/template"
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/cozy/cozy-stack/pkg/utils"
 	"github.com/cozy/gomail"
+	"github.com/go-redis/redis"
 	"github.com/spf13/viper"
 )
 
@@ -68,6 +71,8 @@ type Config struct {
 	AdminPort  int
 	Fs         Fs
 	CouchDB    CouchDB
+	Konnectors Konnectors
+	Cache      Cache
 	Mail       *gomail.DialerOptions
 	Logger     Logger
 }
@@ -82,6 +87,16 @@ type CouchDB struct {
 	URL string
 }
 
+// Konnectors contains the configuration values for the konnectors.
+type Konnectors struct {
+	Cmd string
+}
+
+// Cache contains the configuration values of the caching layer
+type Cache struct {
+	URL string
+}
+
 // Logger contains the configuration values of the logger system
 type Logger struct {
 	Level string
@@ -93,25 +108,6 @@ func FsURL() *url.URL {
 	if err != nil {
 		panic(fmt.Errorf("malformed configuration fs url %s", config.Fs.URL))
 	}
-	return u
-}
-
-// BuildRelFsURL build a new url from the filesystem URL by adding the
-// specified relative path.
-func BuildRelFsURL(rel string) *url.URL {
-	u := FsURL()
-	if u.Path == "" {
-		u.Path = "/"
-	}
-	u.Path = path.Join(u.Path, rel)
-	return u
-}
-
-// BuildAbsFsURL build a new url from the filesystem URL by changing
-// the path to the specified absolute one.
-func BuildAbsFsURL(abs string) *url.URL {
-	u := FsURL()
-	u.Path = path.Join("/", abs)
 	return u
 }
 
@@ -130,6 +126,19 @@ func CouchURL() string {
 	return config.CouchDB.URL
 }
 
+// CacheOptions returns the options for caching redis
+func CacheOptions() *redis.Options {
+	if config.Cache.URL == "" {
+		return nil
+	}
+	opts, err := redis.ParseURL(config.Cache.URL)
+	if err != nil {
+		log.Errorf("can't parse cache.URL(%s), ignoring", config.Cache.URL)
+		return nil
+	}
+	return opts
+}
+
 // IsDevRelease returns whether or not the binary is a development
 // release
 func IsDevRelease() bool {
@@ -141,20 +150,79 @@ func GetConfig() *Config {
 	return config
 }
 
+// Setup Viper to read the environment and the optional config file
+func Setup(cfgFile string) (err error) {
+	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	viper.SetEnvPrefix("cozy")
+	viper.AutomaticEnv()
+
+	if cfgFile == "" {
+		for _, ext := range viper.SupportedExts {
+			var file string
+			file, err = FindConfigFile(Filename + "." + ext)
+			if file != "" && err == nil {
+				cfgFile = file
+				break
+			}
+		}
+	}
+
+	if cfgFile == "" {
+		return UseViper(viper.GetViper())
+	}
+
+	log.Debugf("Using config file: %s", cfgFile)
+
+	tmpl := template.New(filepath.Base(cfgFile))
+	tmpl = tmpl.Option("missingkey=zero")
+	tmpl, err = tmpl.ParseFiles(cfgFile)
+	if err != nil {
+		return fmt.Errorf("Unable to open and parse configuration file template %s: %s", cfgFile, err)
+	}
+
+	dest := new(bytes.Buffer)
+	ctxt := &struct{ Env map[string]string }{Env: envMap()}
+	err = tmpl.ExecuteTemplate(dest, filepath.Base(cfgFile), ctxt)
+	if err != nil {
+		return fmt.Errorf("Template error for config file %s: %s", cfgFile, err)
+	}
+
+	if ext := filepath.Ext(cfgFile); len(ext) > 0 {
+		viper.SetConfigType(ext[1:])
+	}
+	if err := viper.ReadConfig(dest); err != nil {
+		if _, isParseErr := err.(viper.ConfigParseError); isParseErr {
+			log.Errorf("Failed to read cozy-stack configurations from %s", cfgFile)
+			log.Errorf(dest.String())
+			return err
+		}
+	}
+
+	return UseViper(viper.GetViper())
+}
+
+func envMap() map[string]string {
+	env := make(map[string]string)
+	for _, i := range os.Environ() {
+		sep := strings.Index(i, "=")
+		env[i[0:sep]] = i[sep+1:]
+	}
+	return env
+}
+
 // UseViper sets the configured instance of Config
 func UseViper(v *viper.Viper) error {
-	fsURL := v.GetString("fs.url")
-	_, err := url.Parse(fsURL)
+	fsURL, err := url.Parse(v.GetString("fs.url"))
 	if err != nil {
 		return err
 	}
 
-	couchHost := v.GetString("couchdb.host")
-	couchPort := strconv.Itoa(v.GetInt("couchdb.port"))
-	couchURL := "http://" + couchHost + ":" + couchPort + "/"
-	_, err = url.Parse(couchURL)
+	couchURL, err := url.Parse(v.GetString("couchdb.url"))
 	if err != nil {
 		return err
+	}
+	if couchURL.Path == "" {
+		couchURL.Path = "/"
 	}
 
 	config = &Config{
@@ -165,17 +233,24 @@ func UseViper(v *viper.Viper) error {
 		AdminPort:  v.GetInt("admin.port"),
 		Assets:     v.GetString("assets"),
 		Fs: Fs{
-			URL: fsURL,
+			URL: fsURL.String(),
 		},
 		CouchDB: CouchDB{
-			URL: couchURL,
+			URL: couchURL.String(),
+		},
+		Konnectors: Konnectors{
+			Cmd: v.GetString("konnectors.cmd"),
+		},
+		Cache: Cache{
+			URL: v.GetString("cache.url"),
 		},
 		Mail: &gomail.DialerOptions{
-			Host:       v.GetString("mail.host"),
-			Port:       v.GetInt("mail.port"),
-			Username:   v.GetString("mail.username"),
-			Password:   v.GetString("mail.password"),
-			DisableTLS: v.GetBool("mail.disable_tls"),
+			Host:                      v.GetString("mail.host"),
+			Port:                      v.GetInt("mail.port"),
+			Username:                  v.GetString("mail.username"),
+			Password:                  v.GetString("mail.password"),
+			DisableTLS:                v.GetBool("mail.disable_tls"),
+			SkipCertificateValidation: v.GetBool("mail.skip_certificate_validation"),
 		},
 		Logger: Logger{
 			Level: v.GetString("log.level"),
@@ -195,8 +270,10 @@ fs:
   url: mem://test
 
 couchdb:
-    host: localhost
-    port: 5984
+    url: http://localhost:5984/
+
+cache:
+    url: redis://localhost:6379/0
 
 log:
     level: info

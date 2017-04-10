@@ -47,13 +47,27 @@ const (
 
 	// CSPSrcSelf is the 'self' option of a CSP source.
 	CSPSrcSelf CSPSource = iota
+	// CSPSrcData is the 'data:' option of a CSP source.
+	CSPSrcData
+	// CSPSrcBlob is the 'blob:' option of a CSP source.
+	CSPSrcBlob
 	// CSPSrcParent adds the parent domain as an eligible CSP source.
 	CSPSrcParent
-	// CSPSrcParentSubdomains add all the parent's subdomains as eligibles CSP
+	// CSPSrcSiblings add all the siblings subdomains as eligibles CSP
 	// sources.
-	CSPSrcParentSubdomains
+	CSPSrcSiblings
 	// CSPSrcAny is the '*' option. It allows any domain as an eligible source.
 	CSPSrcAny
+	// CSPUnsafeInline is the  'unsafe-inline' option. It allows to have inline
+	// styles or scripts to be injected in the page.
+	CSPUnsafeInline
+	// CSPSrcWhitelist enables the whitelist just below in CSP.
+	CSPSrcWhitelist
+
+	// CSPWhitelist is a whitelist of domains that are allowed in CSP. It's not
+	// permanent, this whitelist will be removed when we will have a more
+	// generic way to enable client-side apps to access some domains (proxy).
+	CSPWhitelist = "*.tile.openstreetmap.org *.tile.osm.org *.tiles.mapbox.com api.mapbox.com"
 )
 
 // Secure returns a Middlefunc that can be used to define all the necessary
@@ -89,39 +103,39 @@ func Secure(conf *SecureConfig) echo.MiddlewareFunc {
 				h.Set(echo.HeaderXFrameOptions, xFrameHeader)
 			}
 			var cspHeader string
-			parent, _ := SplitHost(c.Request().Host)
+			parent, _, siblings := SplitHost(c.Request().Host)
 			if len(conf.CSPDefaultSrc) > 0 {
-				cspHeader += makeCSPHeader(parent, "default-src", conf.CSPDefaultSrc)
+				cspHeader += makeCSPHeader(parent, siblings, "default-src", conf.CSPDefaultSrc)
 			}
 			if len(conf.CSPScriptSrc) > 0 {
-				cspHeader += makeCSPHeader(parent, "script-src", conf.CSPScriptSrc)
+				cspHeader += makeCSPHeader(parent, siblings, "script-src", conf.CSPScriptSrc)
 			}
 			if len(conf.CSPFrameSrc) > 0 {
-				cspHeader += makeCSPHeader(parent, "frame-src", conf.CSPFrameSrc)
+				cspHeader += makeCSPHeader(parent, siblings, "frame-src", conf.CSPFrameSrc)
 			}
 			if len(conf.CSPConnectSrc) > 0 {
-				cspHeader += makeCSPHeader(parent, "connect-src", conf.CSPConnectSrc)
+				cspHeader += makeCSPHeader(parent, siblings, "connect-src", conf.CSPConnectSrc)
 			}
 			if len(conf.CSPFontSrc) > 0 {
-				cspHeader += makeCSPHeader(parent, "font-src", conf.CSPFontSrc)
+				cspHeader += makeCSPHeader(parent, siblings, "font-src", conf.CSPFontSrc)
 			}
 			if len(conf.CSPImgSrc) > 0 {
-				cspHeader += makeCSPHeader(parent, "img-src", conf.CSPImgSrc)
+				cspHeader += makeCSPHeader(parent, siblings, "img-src", conf.CSPImgSrc)
 			}
 			if len(conf.CSPManifestSrc) > 0 {
-				cspHeader += makeCSPHeader(parent, "manifest-src", conf.CSPManifestSrc)
+				cspHeader += makeCSPHeader(parent, siblings, "manifest-src", conf.CSPManifestSrc)
 			}
 			if len(conf.CSPMediaSrc) > 0 {
-				cspHeader += makeCSPHeader(parent, "media-src", conf.CSPMediaSrc)
+				cspHeader += makeCSPHeader(parent, siblings, "media-src", conf.CSPMediaSrc)
 			}
 			if len(conf.CSPObjectSrc) > 0 {
-				cspHeader += makeCSPHeader(parent, "object-src", conf.CSPObjectSrc)
+				cspHeader += makeCSPHeader(parent, siblings, "object-src", conf.CSPObjectSrc)
 			}
 			if len(conf.CSPStyleSrc) > 0 {
-				cspHeader += makeCSPHeader(parent, "style-src", conf.CSPStyleSrc)
+				cspHeader += makeCSPHeader(parent, siblings, "style-src", conf.CSPStyleSrc)
 			}
 			if len(conf.CSPWorkerSrc) > 0 {
-				cspHeader += makeCSPHeader(parent, "worker-src", conf.CSPWorkerSrc)
+				cspHeader += makeCSPHeader(parent, siblings, "worker-src", conf.CSPWorkerSrc)
 			}
 			if cspHeader != "" {
 				h.Set(echo.HeaderContentSecurityPolicy, cspHeader)
@@ -132,18 +146,26 @@ func Secure(conf *SecureConfig) echo.MiddlewareFunc {
 	}
 }
 
-func makeCSPHeader(parent, header string, sources []CSPSource) string {
+func makeCSPHeader(parent, siblings, header string, sources []CSPSource) string {
 	headers := make([]string, len(sources))
 	for i, src := range sources {
 		switch src {
 		case CSPSrcSelf:
 			headers[i] = "'self'"
+		case CSPSrcData:
+			headers[i] = "data:"
+		case CSPSrcBlob:
+			headers[i] = "blob:"
 		case CSPSrcParent:
 			headers[i] = parent
-		case CSPSrcParentSubdomains:
-			headers[i] = "*." + parent
+		case CSPSrcSiblings:
+			headers[i] = siblings
 		case CSPSrcAny:
 			headers[i] = "*"
+		case CSPUnsafeInline:
+			headers[i] = "'unsafe-inline'"
+		case CSPSrcWhitelist:
+			headers[i] = CSPWhitelist
 		}
 	}
 	return header + " " + strings.Join(headers, " ") + ";"

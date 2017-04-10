@@ -50,7 +50,8 @@ If you want to know more about CSS variables, I recommend to view this video:
 
 ### GET /settings/disk-usage
 
-Says how many bytes are used to store files.
+Says how many bytes are available and used to store files. When not
+limited the `quota` field is omitted.
 
 #### Request
 
@@ -74,6 +75,8 @@ Content-type: application/vnd.api+json
     "type": "io.cozy.settings",
     "id": "io.cozy.settings.disk-usage",
     "attributes": {
+      "is_limited": true,
+      "quota": "123456789",
       "used": "12345678"
     }
   }
@@ -171,6 +174,11 @@ Cookie: sessionid=xxxx
 }
 ```
 
+#### Permissions
+
+To use this endpoint, an application needs a permission on the type
+`io.cozy.settings` for the verb `GET`.
+
 ### PUT /settings/instance
 
 If the user is logged in, allow to set the instance fields
@@ -229,6 +237,11 @@ Content-type: application/json
 }
 ```
 
+#### Permissions
+
+To use this endpoint, an application needs a permission on the type
+`io.cozy.settings` for the verb `PUT`.
+
 ## OAuth 2 clients
 
 ### GET /settings/clients
@@ -274,6 +287,11 @@ Content-type: application/json
 }
 ```
 
+#### Permissions
+
+To use this endpoint, an application needs a permission on the type
+`io.cozy.oauth.clients` for the verb `GET` (only client-side apps).
+
 ### DELETE /settings/clients/:client-id
 
 #### Request
@@ -289,3 +307,8 @@ Authorization: Bearer oauth2-clients-token
 ```http
 HTTP/1.1 204 No Content
 ```
+
+#### Permissions
+
+To use this endpoint, an application needs a permission on the type
+`io.cozy.oauth.clients` for the verb `DELETE` (only client-side apps).

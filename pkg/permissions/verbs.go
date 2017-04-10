@@ -35,6 +35,21 @@ func (vs VerbSet) Contains(v Verb) bool {
 	return has
 }
 
+// ContainsAll check if VerbSet contains all passed verbs
+func (vs VerbSet) ContainsAll(verbs VerbSet) bool {
+	if len(vs) == 0 {
+		return true // empty set = ALL
+	}
+
+	for v := range verbs {
+		_, has := vs[v]
+		if !has {
+			return false
+		}
+	}
+	return true
+}
+
 func (vs VerbSet) String() string {
 	out := ""
 	if len(vs) == 0 || len(vs) == allVerbsLength {
@@ -76,13 +91,22 @@ func (vs *VerbSet) UnmarshalJSON(b []byte) error {
 	for v := range ALL {
 		delete(*vs, v)
 	}
-	for v := range *vs {
-		(*vs)[v] = struct{}{}
+	for _, v := range s {
+		(*vs)[Verb(v)] = struct{}{}
 	}
 	return nil
 }
 
+// Merge add verbs to the set
+func (vs *VerbSet) Merge(verbs *VerbSet) {
+	for v := range *verbs {
+		(*vs)[v] = struct{}{}
+	}
+}
+
 // VerbSplit parse a string into a VerbSet
+// Note: this does not check if Verbs are proper HTTP Verbs
+// This behaviour is used in @event trigger
 func VerbSplit(in string) VerbSet {
 	if in == allVerbs {
 		return ALL

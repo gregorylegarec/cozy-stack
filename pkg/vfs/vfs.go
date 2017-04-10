@@ -7,6 +7,7 @@ package vfs
 
 import (
 	"errors"
+	"io"
 	mimetype "mime"
 	"os"
 	"path"
@@ -14,43 +15,22 @@ import (
 	"time"
 
 	"github.com/cozy/cozy-stack/pkg/consts"
-	"github.com/cozy/cozy-stack/pkg/couchdb"
-	"github.com/cozy/cozy-stack/pkg/couchdb/mango"
-	"github.com/spf13/afero"
 )
-
-// Indexes is the list of required indexes by the VFS inside CouchDB.
-var Indexes = []mango.Index{
-	// Used to lookup a file given its parent
-	mango.IndexOnFields("dir_id", "name", "type"),
-	// Used to lookup a directory given its path
-	mango.IndexOnFields("path"),
-	// Used to lookup children of a directory
-	mango.IndexOnFields("dir_id"),
-}
-
-// DiskUsageView is the name of the view used for computing the disk usage
-const DiskUsageView = "disk-usage"
-
-// Views is the required couchdb views for computing the disk usage
-var Views = couchdb.Views{
-	DiskUsageView: couchdb.View{
-		Map:    "function(doc) { if (doc.type === 'file') emit(doc._id, +doc.size); }",
-		Reduce: "_sum",
-	},
-}
 
 // DefaultContentType is used for files uploaded with no content-type
 const DefaultContentType = "application/octet-stream"
 
 // ForbiddenFilenameChars is the list of forbidden characters in a filename.
-const ForbiddenFilenameChars = "/\x00"
+const ForbiddenFilenameChars = "/\x00\n\r"
 
 const (
 	// TrashDirName is the path of the trash directory
 	TrashDirName = "/.cozy_trash"
-	// AppsDirName is the path of the directory in which apps are stored
-	AppsDirName = "/.cozy_apps"
+	// WebappsDirName is the path of the directory in which apps are stored
+	WebappsDirName = "/.cozy_apps"
+	// KonnectorsDirName is the path of the directory in which konnectors source
+	// are stored
+	KonnectorsDirName = "/.cozy_konnectors"
 )
 
 const (
@@ -62,11 +42,139 @@ const (
 // directory. It is not returned by any function of the package.
 var ErrSkipDir = errors.New("skip directories")
 
-// Context is used to convey the afero.Fs object along with the
-// CouchDb database prefix.
-type Context interface {
-	couchdb.Database
-	FS() afero.Fs
+// Fs is an interface providing a set of high-level methods to interact with
+// the file-system binaries and metadata.
+type Fs interface {
+	InitFs() error
+	Delete() error
+
+	// CreateDir is used to create a new directory from its document.
+	CreateDir(doc *DirDoc) error
+	// CreateFile creates a new file or update the content of an existing file.
+	// The first argument contains the document of the new or update version of
+	// the file. The second argument is the optional old document of the old
+	// version of the file.
+	//
+	// Warning: you MUST call the Close() method and check for its error.
+	CreateFile(newdoc, olddoc *FileDoc) (File, error)
+	// DestroyDirContent destroys all directories and files contained in a
+	// directory.
+	DestroyDirContent(doc *DirDoc) error
+	// DestroyDirAndContent destroys all directories and files contained in a
+	// directory and the directory itself.
+	DestroyDirAndContent(doc *DirDoc) error
+	// DestroyFile  destroys a file from the trash.
+	DestroyFile(doc *FileDoc) error
+	// OpenFile return a file handler for reading associated with the given file
+	// document. The file handler implements io.ReadCloser and io.Seeker.
+	OpenFile(doc *FileDoc) (File, error)
+}
+
+// File is a reader, writer, seeker, closer iterface reprsenting an opened
+// file for reading or writing.
+type File interface {
+	io.Reader
+	io.Seeker
+	io.Writer
+	io.Closer
+}
+
+// Indexer is an interface providing a common set of method for indexing layer
+// of our VFS.
+//
+// An indexer is typically responsible for storing and indexing the files and
+// directories metadata, as well as caching them if necessary.
+type Indexer interface {
+	InitIndex() error
+
+	// DiskUsage computes the total size of the files contained in the VFS.
+	DiskUsage() (int64, error)
+
+	// CreateFileDoc creates and add in the index a new file document.
+	CreateFileDoc(doc *FileDoc) error
+	// UpdateFileDoc is used to update the document of a file. It takes the
+	// new file document that you want to create and the old document,
+	// representing the current revision of the file.
+	UpdateFileDoc(olddoc, newdoc *FileDoc) error
+	// DeleteFileDoc removes from the index the specified file document.
+	DeleteFileDoc(doc *FileDoc) error
+
+	// CreateDirDoc creates and add in the index a new directory document.
+	CreateDirDoc(doc *DirDoc) error
+	// UpdateDirDoc is used to update the document of a directory. It takes the
+	// new directory document that you want to create and the old document,
+	// representing the current revision of the directory.
+	UpdateDirDoc(olddoc, newdoc *DirDoc) error
+	// DeleteDirDoc removes from the index the specified directory document.
+	DeleteDirDoc(doc *DirDoc) error
+
+	// DirByID returns the directory document information associated with the
+	// specified identifier.
+	DirByID(fileID string) (*DirDoc, error)
+	// DirByPath returns the directory document information associated with the
+	// specified path.
+	DirByPath(name string) (*DirDoc, error)
+
+	// FileByID returns the file document information associated with the
+	// specified identifier.
+	FileByID(fileID string) (*FileDoc, error)
+	// FileByPath returns the file document information associated with the
+	// specified path.
+	FileByPath(name string) (*FileDoc, error)
+	FilePath(doc *FileDoc) (string, error)
+
+	// DirOrFileByID returns the document from its identifier without knowing in
+	// advance its type. One of the returned argument is not nil.
+	DirOrFileByID(fileID string) (*DirDoc, *FileDoc, error)
+	// DirOrFileByID returns the document from its path without knowing in
+	// advance its type. One of the returned argument is not nil.
+	DirOrFileByPath(name string) (*DirDoc, *FileDoc, error)
+
+	// DirIterator returns an iterator over the children of the specified
+	// directory.
+	DirIterator(doc *DirDoc, opts *IteratorOptions) DirIterator
+}
+
+// Locker interface provides a Read/Write mutex interface that can be used
+// to represent a global locker for a VFS.
+type Locker interface {
+	RLock()
+	RUnlock()
+	Lock()
+	Unlock()
+}
+
+// DiskThresholder it an interface that can be implemeted to known how many space
+// is available on the disk.
+type DiskThresholder interface {
+	// DiskQuota returns the total number of bytes allowed to be stored in the
+	// VFS. If minus or equal to zero, it is considered without limit.
+	DiskQuota() int64
+}
+
+// VFS is composed of the Indexer and Fs interface. It is the common interface
+// used thoughout the stack to access the VFS.
+type VFS interface {
+	Indexer
+	DiskThresholder
+	Fs
+}
+
+// ErrIteratorDone is returned by the Next() method of the iterator when
+// the iterator is actually done.
+var ErrIteratorDone = errors.New("No more element in the iterator")
+
+// IteratorOptions contains the options of the iterator.
+type IteratorOptions struct {
+	AfterID string
+	ByFetch int
+}
+
+// DirIterator is the interface that an iterator over a specific directory
+// should implement. The Next method will return a ErrIteratorDone when the
+// iterator is over and does not have element anymore.
+type DirIterator interface {
+	Next() (*DirDoc, *FileDoc, error)
 }
 
 // DocPatch is a struct containing modifiable fields from file and
@@ -86,11 +194,12 @@ type DirOrFileDoc struct {
 	DirDoc
 
 	// fields from FileDoc not contained in DirDoc
-	Size       int64  `json:"size,string"`
-	MD5Sum     []byte `json:"md5sum"`
-	Mime       string `json:"mime"`
-	Class      string `json:"class"`
-	Executable bool   `json:"executable"`
+	ByteSize   int64    `json:"size,string"`
+	MD5Sum     []byte   `json:"md5sum"`
+	Mime       string   `json:"mime"`
+	Class      string   `json:"class"`
+	Executable bool     `json:"executable"`
+	Metadata   Metadata `json:"metadata,omitempty"`
 }
 
 // Refine returns either a DirDoc or FileDoc pointer depending on the type of
@@ -104,70 +213,40 @@ func (fd *DirOrFileDoc) Refine() (*DirDoc, *FileDoc) {
 			Type:        fd.Type,
 			DocID:       fd.DocID,
 			DocRev:      fd.DocRev,
-			Name:        fd.Name,
+			DocName:     fd.DocName,
 			DirID:       fd.DirID,
 			RestorePath: fd.RestorePath,
 			CreatedAt:   fd.CreatedAt,
 			UpdatedAt:   fd.UpdatedAt,
-			Size:        fd.Size,
+			ByteSize:    fd.ByteSize,
 			MD5Sum:      fd.MD5Sum,
 			Mime:        fd.Mime,
 			Class:       fd.Class,
 			Executable:  fd.Executable,
 			Tags:        fd.Tags,
+			Metadata:    fd.Metadata,
 		}
 	}
 	return nil, nil
 }
 
-// GetDirOrFileDoc is used to fetch a document from its identifier
-// without knowing in advance its type.
-func GetDirOrFileDoc(c Context, fileID string, withChildren bool) (*DirDoc, *FileDoc, error) {
-	dirOrFile := &DirOrFileDoc{}
-	err := couchdb.GetDoc(c, consts.Files, fileID, dirOrFile)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	dirDoc, fileDoc := dirOrFile.Refine()
-	if dirDoc != nil && withChildren {
-		dirDoc.FetchFiles(c)
-	}
-	return dirDoc, fileDoc, nil
-}
-
-// GetDirOrFileDocFromPath is used to fetch a document from its path
-// without knowning in advance its type.
-func GetDirOrFileDocFromPath(c Context, name string, withChildren bool) (*DirDoc, *FileDoc, error) {
-	dirDoc, err := GetDirDocFromPath(c, name, withChildren)
-	if err != nil && !os.IsNotExist(err) {
-		return nil, nil, err
-	}
-	if err == nil {
-		return dirDoc, nil, nil
-	}
-
-	fileDoc, err := GetFileDocFromPath(c, name)
-	if err != nil && !os.IsNotExist(err) {
-		return nil, nil, err
-	}
-	if err == nil {
-		return nil, fileDoc, nil
-	}
-
-	return nil, nil, err
-}
-
 // Stat returns the FileInfo of the specified file or directory.
-func Stat(c Context, name string) (os.FileInfo, error) {
-	return c.FS().Stat(name)
+func Stat(fs VFS, name string) (os.FileInfo, error) {
+	d, f, err := fs.DirOrFileByPath(name)
+	if err != nil {
+		return nil, err
+	}
+	if d != nil {
+		return d, nil
+	}
+	return f, nil
 }
 
 // OpenFile returns a file handler of the specified name. It is a
 // generalized the generilized call used to open a file. It opens the
 // file with the given flag (O_RDONLY, O_WRONLY, O_CREATE, O_EXCL) and
 // permission.
-func OpenFile(c Context, name string, flag int, perm os.FileMode) (*File, error) {
+func OpenFile(fs VFS, name string, flag int, perm os.FileMode) (File, error) {
 	if flag&os.O_RDWR != 0 || flag&os.O_APPEND != 0 {
 		return nil, os.ErrInvalid
 	}
@@ -178,18 +257,18 @@ func OpenFile(c Context, name string, flag int, perm os.FileMode) (*File, error)
 	name = path.Clean(name)
 
 	if flag == os.O_RDONLY {
-		doc, err := GetFileDocFromPath(c, name)
+		doc, err := fs.FileByPath(name)
 		if err != nil {
 			return nil, err
 		}
-		return Open(c, doc)
+		return fs.OpenFile(doc)
 	}
 
 	var dirID string
-	olddoc, err := GetFileDocFromPath(c, name)
+	olddoc, err := fs.FileByPath(name)
 	if os.IsNotExist(err) && flag&os.O_CREATE != 0 {
 		var parent *DirDoc
-		parent, err = GetDirDocFromPath(c, path.Dir(name), false)
+		parent, err = fs.DirByPath(path.Dir(name))
 		if err != nil {
 			return nil, err
 		}
@@ -214,44 +293,34 @@ func OpenFile(c Context, name string, flag int, perm os.FileMode) (*File, error)
 	if err != nil {
 		return nil, err
 	}
-	return CreateFile(c, newdoc, olddoc)
+	return fs.CreateFile(newdoc, olddoc)
 }
 
 // Create creates a new file with specified and returns a File handler
 // that can be used for writing.
-func Create(c Context, name string) (*File, error) {
-	return OpenFile(c, name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
-}
-
-// ReadDir returns a list of FileInfo of all the direct children of
-// the specified directory.
-func ReadDir(c Context, name string) ([]os.FileInfo, error) {
-	if !path.IsAbs(name) {
-		return nil, ErrNonAbsolutePath
-	}
-
-	return afero.ReadDir(c.FS(), name)
+func Create(fs VFS, name string) (File, error) {
+	return OpenFile(fs, name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
 }
 
 // Mkdir creates a new directory with the specified name
-func Mkdir(c Context, name string, tags []string) (*DirDoc, error) {
+func Mkdir(fs VFS, name string, tags []string) (*DirDoc, error) {
 	name = path.Clean(name)
 	if name == "/" {
 		return nil, ErrParentDoesNotExist
 	}
 
 	dirname, dirpath := path.Base(name), path.Dir(name)
-	parent, err := GetDirDocFromPath(c, dirpath, false)
+	parent, err := fs.DirByPath(dirpath)
 	if err != nil {
 		return nil, err
 	}
 
-	dir, err := NewDirDoc(dirname, parent.ID(), tags, nil)
+	dir, err := NewDirDocWithParent(dirname, parent, tags)
 	if err != nil {
 		return nil, err
 	}
 
-	if err = CreateDir(c, dir); err != nil {
+	if err = fs.CreateDir(dir); err != nil {
 		return nil, err
 	}
 
@@ -260,7 +329,7 @@ func Mkdir(c Context, name string, tags []string) (*DirDoc, error) {
 
 // MkdirAll creates a directory named path, along with any necessary
 // parents, and returns nil, or else returns an error.
-func MkdirAll(c Context, name string, tags []string) (*DirDoc, error) {
+func MkdirAll(fs VFS, name string, tags []string) (*DirDoc, error) {
 	var err error
 	var dirs []string
 	var base, file string
@@ -268,7 +337,7 @@ func MkdirAll(c Context, name string, tags []string) (*DirDoc, error) {
 
 	base = name
 	for {
-		parent, err = GetDirDocFromPath(c, base, false)
+		parent, err = fs.DirByPath(base)
 		if os.IsNotExist(err) {
 			base, file = path.Dir(base), path.Base(base)
 			dirs = append(dirs, file)
@@ -281,9 +350,9 @@ func MkdirAll(c Context, name string, tags []string) (*DirDoc, error) {
 	}
 
 	for i := len(dirs) - 1; i >= 0; i-- {
-		parent, err = NewDirDoc(dirs[i], parent.ID(), nil, parent)
+		parent, err = NewDirDocWithParent(dirs[i], parent, nil)
 		if err == nil {
-			err = CreateDir(c, parent)
+			err = fs.CreateDir(parent)
 		}
 		if err != nil {
 			return nil, err
@@ -295,8 +364,8 @@ func MkdirAll(c Context, name string, tags []string) (*DirDoc, error) {
 
 // Rename will rename a file or directory from a specified path to
 // another.
-func Rename(c Context, oldpath, newpath string) error {
-	dir, file, err := GetDirOrFileDocFromPath(c, oldpath, false)
+func Rename(fs VFS, oldpath, newpath string) error {
+	dir, file, err := fs.DirOrFileByPath(oldpath)
 	if err != nil {
 		return err
 	}
@@ -306,7 +375,7 @@ func Rename(c Context, oldpath, newpath string) error {
 	var newdirID *string
 	if path.Dir(oldpath) != path.Dir(newpath) {
 		var parent *DirDoc
-		parent, err = GetDirDocFromPath(c, path.Dir(newpath), false)
+		parent, err = fs.DirByPath(path.Dir(newpath))
 		if err != nil {
 			return err
 		}
@@ -321,37 +390,68 @@ func Rename(c Context, oldpath, newpath string) error {
 	}
 
 	if dir != nil {
-		_, err = ModifyDirMetadata(c, dir, patch)
+		_, err = ModifyDirMetadata(fs, dir, patch)
 	} else {
-		_, err = ModifyFileMetadata(c, file, patch)
+		_, err = ModifyFileMetadata(fs, file, patch)
 	}
 
 	return err
 }
 
 // Remove removes the specified named file or directory.
-func Remove(c Context, name string) error {
-	if !path.IsAbs(name) {
-		return ErrNonAbsolutePath
+func Remove(fs VFS, name string) error {
+	dir, file, err := fs.DirOrFileByPath(name)
+	if err != nil {
+		return err
 	}
-
-	// TODO: fix this remove method implemented for now only to support
-	// go-git. This method should also remove the document from
-	// database.
-	return c.FS().Remove(name)
+	if file != nil {
+		return fs.DestroyFile(file)
+	}
+	empty, err := dir.IsEmpty(fs)
+	if err != nil {
+		return err
+	}
+	if !empty {
+		return ErrDirNotEmpty
+	}
+	return fs.DestroyDirAndContent(dir)
 }
 
-// DiskUsage computes the total size of the files
-func DiskUsage(c Context) (int64, error) {
-	var doc couchdb.ViewResponse
-	err := couchdb.ExecView(c, consts.Files, DiskUsageView, &doc)
+// RemoveAll removes the specified name file or directory and its content.
+func RemoveAll(fs VFS, name string) error {
+	dir, file, err := fs.DirOrFileByPath(name)
 	if err != nil {
-		return 0, err
+		return err
 	}
-	if len(doc.Rows) == 0 {
-		return 0, nil
+	if dir != nil {
+		return fs.DestroyDirAndContent(dir)
 	}
-	return doc.Rows[0].Value, nil
+	return fs.DestroyFile(file)
+}
+
+// Exists returns wether or not the specified path exist in the file system.
+func Exists(fs VFS, name string) (bool, error) {
+	_, _, err := fs.DirOrFileByPath(name)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// DirExists returns wether or not the specified path exist in the file system
+// and is associated with a directory.
+func DirExists(fs VFS, name string) (bool, error) {
+	_, err := fs.DirByPath(name)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // WalkFn type works like filepath.WalkFn type function. It receives
@@ -362,15 +462,15 @@ type WalkFn func(name string, dir *DirDoc, file *FileDoc, err error) error
 
 // Walk walks the file tree document rooted at root. It should work
 // like filepath.Walk.
-func Walk(c Context, root string, walkFn WalkFn) error {
-	dir, file, err := GetDirOrFileDocFromPath(c, root, false)
+func Walk(fs VFS, root string, walkFn WalkFn) error {
+	dir, file, err := fs.DirOrFileByPath(root)
 	if err != nil {
 		return walkFn(root, dir, file, err)
 	}
-	return walk(c, root, dir, file, walkFn)
+	return walk(fs, root, dir, file, walkFn)
 }
 
-func walk(c Context, name string, dir *DirDoc, file *FileDoc, walkFn WalkFn) error {
+func walk(fs VFS, name string, dir *DirDoc, file *FileDoc, walkFn WalkFn) error {
 	err := walkFn(name, dir, file, nil)
 	if err != nil {
 		if dir != nil && err == ErrSkipDir {
@@ -378,32 +478,28 @@ func walk(c Context, name string, dir *DirDoc, file *FileDoc, walkFn WalkFn) err
 		}
 		return err
 	}
-
 	if file != nil {
 		return nil
 	}
-
-	err = dir.FetchFiles(c)
-	if err != nil {
-		return walkFn(name, dir, nil, err)
-	}
-
-	for _, d := range dir.dirs {
-		fullpath := path.Join(name, d.Name)
-		err = walk(c, fullpath, d, nil, walkFn)
-		if err != nil && err != ErrSkipDir {
-			return err
+	iter := fs.DirIterator(dir, nil)
+	for {
+		f, d, err := iter.Next()
+		if err == ErrIteratorDone {
+			break
 		}
-	}
-
-	for _, f := range dir.files {
-		fullpath := path.Join(name, f.Name)
-		err = walk(c, fullpath, nil, f, walkFn)
 		if err != nil {
+			return walkFn(name, nil, nil, err)
+		}
+		var fullpath string
+		if f != nil {
+			fullpath = path.Join(name, f.DocName)
+		} else {
+			fullpath = path.Join(name, d.DocName)
+		}
+		if err = walk(fs, fullpath, f, d, walkFn); err != nil {
 			return err
 		}
 	}
-
 	return nil
 }
 
@@ -441,20 +537,10 @@ func ExtractMimeAndClassFromFilename(name string) (mime, class string) {
 	return ExtractMimeAndClass(mimetype.TypeByExtension(ext))
 }
 
-// getParentDir returns the parent directory document if nil.
-func getParentDir(c Context, parent *DirDoc, dirID string) (*DirDoc, error) {
-	if parent != nil {
-		return parent, nil
-	}
-	var err error
-	parent, err = GetDirDoc(c, dirID, false)
-	return parent, err
-}
-
 // getRestoreDir returns the restoration directory document from a file a
 // directory path. The specified file path should be part of the trash
 // directory.
-func getRestoreDir(c Context, name, restorePath string) (*DirDoc, error) {
+func getRestoreDir(fs VFS, name, restorePath string) (*DirDoc, error) {
 	if !strings.HasPrefix(name, TrashDirName) {
 		return nil, ErrFileNotInTrash
 	}
@@ -473,12 +559,12 @@ func getRestoreDir(c Context, name, restorePath string) (*DirDoc, error) {
 		if split >= 0 {
 			root := name[:split]
 			rest := path.Dir(name[split+1:])
-			doc, err := GetDirDocFromPath(c, TrashDirName+"/"+root, false)
+			doc, err := fs.DirByPath(TrashDirName + "/" + root)
 			if err != nil {
 				return nil, err
 			}
 			if doc.RestorePath != "" {
-				restorePath = path.Join(doc.RestorePath, doc.Name, rest)
+				restorePath = path.Join(doc.RestorePath, doc.DocName, rest)
 			}
 		}
 	}
@@ -491,9 +577,9 @@ func getRestoreDir(c Context, name, restorePath string) (*DirDoc, error) {
 
 	// If the restore directory does not exist anymore, we re-create the
 	// directory hierarchy to restore the file in.
-	restoreDir, err := GetDirDocFromPath(c, restorePath, false)
+	restoreDir, err := fs.DirByPath(restorePath)
 	if os.IsNotExist(err) {
-		restoreDir, err = MkdirAll(c, restorePath, nil)
+		restoreDir, err = MkdirAll(fs, restorePath, nil)
 	}
 
 	return restoreDir, err

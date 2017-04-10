@@ -5,11 +5,11 @@ package auth_test
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net/http"
-	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
 	"os"
@@ -25,6 +25,7 @@ import (
 	"github.com/cozy/cozy-stack/pkg/oauth"
 	"github.com/cozy/cozy-stack/pkg/permissions"
 	"github.com/cozy/cozy-stack/pkg/sessions"
+	"github.com/cozy/cozy-stack/tests/testutils"
 	"github.com/cozy/cozy-stack/web"
 	"github.com/cozy/cozy-stack/web/apps"
 	"github.com/cozy/cozy-stack/web/middlewares"
@@ -37,24 +38,8 @@ const domain = "cozy.example.net"
 
 var ts *httptest.Server
 var testInstance *instance.Instance
-var instanceURL *url.URL
 
-// Stupid http.CookieJar which always returns all cookies.
-// NOTE golang stdlib uses cookies for the URL (ie the testserver),
-// not for the host (ie the instance), so we do it manually
-type testJar struct {
-	Jar *cookiejar.Jar
-}
-
-func (j *testJar) Cookies(u *url.URL) (cookies []*http.Cookie) {
-	return j.Jar.Cookies(instanceURL)
-}
-
-func (j *testJar) SetCookies(u *url.URL, cookies []*http.Cookie) {
-	j.Jar.SetCookies(instanceURL, cookies)
-}
-
-var jar *testJar
+var jar http.CookieJar
 var client *http.Client
 var clientID string
 var clientSecret string
@@ -71,40 +56,52 @@ func TestIsLoggedInWhenNotLoggedIn(t *testing.T) {
 	assert.Equal(t, "who_are_you", content)
 }
 
+func TestHomeWhenNotLoggedIn(t *testing.T) {
+	req, _ := http.NewRequest("GET", ts.URL+"/", nil)
+	req.Host = domain
+	res, err := client.Do(req)
+	assert.NoError(t, err)
+	defer res.Body.Close()
+	if assert.Equal(t, "303 See Other", res.Status) {
+		assert.Equal(t, "https://cozy.example.net/auth/login",
+			res.Header.Get("Location"))
+	}
+}
+
 func TestShowLoginPage(t *testing.T) {
 	req, _ := http.NewRequest("GET", ts.URL+"/auth/login", nil)
 	req.Host = domain
 	res, err := client.Do(req)
-	defer res.Body.Close()
 	assert.NoError(t, err)
+	defer res.Body.Close()
 	assert.Equal(t, "200 OK", res.Status)
 	assert.Equal(t, "text/html; charset=UTF-8", res.Header.Get("Content-Type"))
 	body, _ := ioutil.ReadAll(res.Body)
-	assert.Contains(t, string(body), "Please enter your passphrase")
+	assert.Contains(t, string(body), "Enter your password to access your Cozy")
 }
 
 func TestShowLoginPageWithRedirectBadURL(t *testing.T) {
 	req1, _ := http.NewRequest("GET", ts.URL+"/auth/login?redirect="+url.QueryEscape(" "), nil)
 	req1.Host = domain
 	res1, err := client.Do(req1)
-	defer res1.Body.Close()
 	assert.NoError(t, err)
+	defer res1.Body.Close()
 	assert.Equal(t, "400 Bad Request", res1.Status)
 	assert.Equal(t, "text/plain; charset=UTF-8", res1.Header.Get("Content-Type"))
 
 	req2, _ := http.NewRequest("GET", ts.URL+"/auth/login?redirect="+url.QueryEscape("foo.bar"), nil)
 	req2.Host = domain
 	res2, err := client.Do(req2)
-	defer res2.Body.Close()
 	assert.NoError(t, err)
+	defer res2.Body.Close()
 	assert.Equal(t, "400 Bad Request", res2.Status)
 	assert.Equal(t, "text/plain; charset=UTF-8", res2.Header.Get("Content-Type"))
 
 	req3, _ := http.NewRequest("GET", ts.URL+"/auth/login?redirect="+url.QueryEscape("ftp://sub."+domain+"/foo"), nil)
 	req3.Host = domain
 	res3, err := client.Do(req3)
-	defer res3.Body.Close()
 	assert.NoError(t, err)
+	defer res3.Body.Close()
 	assert.Equal(t, "400 Bad Request", res3.Status)
 	assert.Equal(t, "text/plain; charset=UTF-8", res3.Header.Get("Content-Type"))
 }
@@ -113,8 +110,8 @@ func TestShowLoginPageWithRedirectXSS(t *testing.T) {
 	req, _ := http.NewRequest("GET", ts.URL+"/auth/login?redirect="+url.QueryEscape("https://sub."+domain+"/<script>alert('foo')</script>"), nil)
 	req.Host = domain
 	res, err := client.Do(req)
-	defer res.Body.Close()
 	assert.NoError(t, err)
+	defer res.Body.Close()
 	assert.Equal(t, "200 OK", res.Status)
 	assert.Equal(t, "text/html; charset=UTF-8", res.Header.Get("Content-Type"))
 	body, _ := ioutil.ReadAll(res.Body)
@@ -126,26 +123,26 @@ func TestShowLoginPageWithRedirectFragment(t *testing.T) {
 	req, _ := http.NewRequest("GET", ts.URL+"/auth/login?redirect="+url.QueryEscape("https://sub."+domain+"/#myfragment"), nil)
 	req.Host = domain
 	res, err := client.Do(req)
-	defer res.Body.Close()
 	assert.NoError(t, err)
+	defer res.Body.Close()
 	assert.Equal(t, "200 OK", res.Status)
 	assert.Equal(t, "text/html; charset=UTF-8", res.Header.Get("Content-Type"))
 	body, _ := ioutil.ReadAll(res.Body)
 	assert.NotContains(t, string(body), "myfragment")
-	assert.Contains(t, string(body), `<input type="hidden" name="redirect" value="https://sub.cozy.example.net/#" />`)
+	assert.Contains(t, string(body), `<input id="redirect" type="hidden" name="redirect" value="https://sub.cozy.example.net/#" />`)
 }
 
 func TestShowLoginPageWithRedirectSuccess(t *testing.T) {
 	req, _ := http.NewRequest("GET", ts.URL+"/auth/login?redirect="+url.QueryEscape("https://sub."+domain+"/foo/bar?query=foo#myfragment"), nil)
 	req.Host = domain
 	res, err := client.Do(req)
-	defer res.Body.Close()
 	assert.NoError(t, err)
+	defer res.Body.Close()
 	assert.Equal(t, "200 OK", res.Status)
 	assert.Equal(t, "text/html; charset=UTF-8", res.Header.Get("Content-Type"))
 	body, _ := ioutil.ReadAll(res.Body)
 	assert.NotContains(t, string(body), "myfragment")
-	assert.Contains(t, string(body), `<input type="hidden" name="redirect" value="https://sub.cozy.example.net/foo/bar?query=foo#" />`)
+	assert.Contains(t, string(body), `<input id="redirect" type="hidden" name="redirect" value="https://sub.cozy.example.net/foo/bar?query=foo#" />`)
 }
 
 func TestLoginWithBadPassphrase(t *testing.T) {
@@ -164,7 +161,7 @@ func TestLoginWithGoodPassphrase(t *testing.T) {
 	assert.NoError(t, err)
 	defer res.Body.Close()
 	if assert.Equal(t, "303 See Other", res.Status) {
-		assert.Equal(t, "https://home.cozy.example.net/#",
+		assert.Equal(t, "https://files.cozy.example.net/#",
 			res.Header.Get("Location"))
 		cookies := res.Cookies()
 		assert.Len(t, cookies, 1)
@@ -209,21 +206,22 @@ func TestLoginWithSessionCode(t *testing.T) {
 	// Login
 	res, err = postForm("/auth/login", &url.Values{
 		"passphrase": {"MyPassphrase"},
-		"redirect":   {"https://app." + domain + "/private"},
+		"redirect":   {"https://cozy-app.example.net/private"},
 	})
 	assert.NoError(t, err)
 	res.Body.Close()
 	if assert.Equal(t, "303 See Other", res.Status) {
 		location, err2 := url.Parse(res.Header.Get("Location"))
 		assert.NoError(t, err2)
-		assert.Equal(t, "app.cozy.example.net", location.Host)
+		assert.Equal(t, "cozy-app.example.net", location.Host)
 		assert.Equal(t, "/private", location.Path)
 		code2 := location.Query().Get("code")
 		assert.Len(t, code2, 22)
 	}
 
 	// Already logged-in (GET)
-	req, _ = http.NewRequest("GET", ts.URL+"/auth/login?redirect="+url.QueryEscape("https://app."+domain+"/private"), nil)
+	req, err = http.NewRequest("GET", ts.URL+"/auth/login?redirect="+url.QueryEscape("https://cozy-app.example.net/private"), nil)
+	assert.NoError(t, err)
 	req.Host = domain
 	res, err = client.Do(req)
 	assert.NoError(t, err)
@@ -231,7 +229,7 @@ func TestLoginWithSessionCode(t *testing.T) {
 	if assert.Equal(t, "303 See Other", res.Status) {
 		location, err2 := url.Parse(res.Header.Get("Location"))
 		assert.NoError(t, err2)
-		assert.Equal(t, "app.cozy.example.net", location.Host)
+		assert.Equal(t, "cozy-app.example.net", location.Host)
 		assert.Equal(t, "/private", location.Path)
 		code2 := location.Query().Get("code")
 		assert.Len(t, code2, 22)
@@ -240,14 +238,14 @@ func TestLoginWithSessionCode(t *testing.T) {
 	// Already logged-in (POST)
 	res, err = postForm("/auth/login", &url.Values{
 		"passphrase": {"MyPassphrase"},
-		"redirect":   {"https://app." + domain + "/private"},
+		"redirect":   {"https://cozy-app.example.net/private"},
 	})
 	assert.NoError(t, err)
 	res.Body.Close()
 	if assert.Equal(t, "303 See Other", res.Status) {
 		location, err2 := url.Parse(res.Header.Get("Location"))
 		assert.NoError(t, err2)
-		assert.Equal(t, "app.cozy.example.net", location.Host)
+		assert.Equal(t, "cozy-app.example.net", location.Host)
 		assert.Equal(t, "/private", location.Path)
 		code2 := location.Query().Get("code")
 		assert.Len(t, code2, 22)
@@ -258,6 +256,18 @@ func TestIsLoggedInAfterLogin(t *testing.T) {
 	content, err := getTestURL()
 	assert.NoError(t, err)
 	assert.Equal(t, "logged_in", content)
+}
+
+func TestHomeWhenLoggedIn(t *testing.T) {
+	req, _ := http.NewRequest("GET", ts.URL+"/", nil)
+	req.Host = domain
+	res, err := client.Do(req)
+	assert.NoError(t, err)
+	defer res.Body.Close()
+	if assert.Equal(t, "303 See Other", res.Status) {
+		assert.Equal(t, "https://files.cozy.example.net/",
+			res.Header.Get("Location"))
+	}
 }
 
 func TestRegisterClientNotJSON(t *testing.T) {
@@ -553,8 +563,8 @@ func TestAuthorizeFormRedirectsWhenNotLoggedIn(t *testing.T) {
 	req, _ := http.NewRequest("GET", ts.URL+"/auth/authorize?response_type=code&state=123456&scope=files:read&redirect_uri="+u+"&client_id="+clientID, nil)
 	req.Host = domain
 	res, err := anonymousClient.Do(req)
-	defer res.Body.Close()
 	assert.NoError(t, err)
+	defer res.Body.Close()
 	assert.Equal(t, "303 See Other", res.Status)
 }
 
@@ -563,8 +573,8 @@ func TestAuthorizeFormBadResponseType(t *testing.T) {
 	req, _ := http.NewRequest("GET", ts.URL+"/auth/authorize?response_type=token&state=123456&scope=files:read&redirect_uri="+u+"&client_id="+clientID, nil)
 	req.Host = domain
 	res, err := client.Do(req)
-	defer res.Body.Close()
 	assert.NoError(t, err)
+	defer res.Body.Close()
 	assert.Equal(t, "400 Bad Request", res.Status)
 	assert.Equal(t, "text/html; charset=UTF-8", res.Header.Get("Content-Type"))
 	body, _ := ioutil.ReadAll(res.Body)
@@ -576,8 +586,8 @@ func TestAuthorizeFormNoState(t *testing.T) {
 	req, _ := http.NewRequest("GET", ts.URL+"/auth/authorize?response_type=code&scope=files:read&redirect_uri="+u+"&client_id="+clientID, nil)
 	req.Host = domain
 	res, err := client.Do(req)
-	defer res.Body.Close()
 	assert.NoError(t, err)
+	defer res.Body.Close()
 	assert.Equal(t, "400 Bad Request", res.Status)
 	assert.Equal(t, "text/html; charset=UTF-8", res.Header.Get("Content-Type"))
 	body, _ := ioutil.ReadAll(res.Body)
@@ -589,8 +599,8 @@ func TestAuthorizeFormNoClientId(t *testing.T) {
 	req, _ := http.NewRequest("GET", ts.URL+"/auth/authorize?response_type=code&state=123456&scope=files:read&redirect_uri="+u, nil)
 	req.Host = domain
 	res, err := client.Do(req)
-	defer res.Body.Close()
 	assert.NoError(t, err)
+	defer res.Body.Close()
 	assert.Equal(t, "400 Bad Request", res.Status)
 	assert.Equal(t, "text/html; charset=UTF-8", res.Header.Get("Content-Type"))
 	body, _ := ioutil.ReadAll(res.Body)
@@ -601,8 +611,8 @@ func TestAuthorizeFormNoRedirectURI(t *testing.T) {
 	req, _ := http.NewRequest("GET", ts.URL+"/auth/authorize?response_type=code&state=123456&scope=files:read&client_id="+clientID, nil)
 	req.Host = domain
 	res, err := client.Do(req)
-	defer res.Body.Close()
 	assert.NoError(t, err)
+	defer res.Body.Close()
 	assert.Equal(t, "400 Bad Request", res.Status)
 	assert.Equal(t, "text/html; charset=UTF-8", res.Header.Get("Content-Type"))
 	body, _ := ioutil.ReadAll(res.Body)
@@ -614,8 +624,8 @@ func TestAuthorizeFormNoScope(t *testing.T) {
 	req, _ := http.NewRequest("GET", ts.URL+"/auth/authorize?response_type=code&state=123456&redirect_uri="+u+"&client_id="+clientID, nil)
 	req.Host = domain
 	res, err := client.Do(req)
-	defer res.Body.Close()
 	assert.NoError(t, err)
+	defer res.Body.Close()
 	assert.Equal(t, "400 Bad Request", res.Status)
 	assert.Equal(t, "text/html; charset=UTF-8", res.Header.Get("Content-Type"))
 	body, _ := ioutil.ReadAll(res.Body)
@@ -627,8 +637,8 @@ func TestAuthorizeFormInvalidClient(t *testing.T) {
 	req, _ := http.NewRequest("GET", ts.URL+"/auth/authorize?response_type=code&state=123456&scope=files:read&redirect_uri="+u+"&client_id=f00", nil)
 	req.Host = domain
 	res, err := client.Do(req)
-	defer res.Body.Close()
 	assert.NoError(t, err)
+	defer res.Body.Close()
 	assert.Equal(t, "400 Bad Request", res.Status)
 	assert.Equal(t, "text/html; charset=UTF-8", res.Header.Get("Content-Type"))
 	body, _ := ioutil.ReadAll(res.Body)
@@ -640,8 +650,8 @@ func TestAuthorizeFormInvalidRedirectURI(t *testing.T) {
 	req, _ := http.NewRequest("GET", ts.URL+"/auth/authorize?response_type=code&state=123456&scope=files:read&redirect_uri="+u+"&client_id="+clientID, nil)
 	req.Host = domain
 	res, err := client.Do(req)
-	defer res.Body.Close()
 	assert.NoError(t, err)
+	defer res.Body.Close()
 	assert.Equal(t, "400 Bad Request", res.Status)
 	assert.Equal(t, "text/html; charset=UTF-8", res.Header.Get("Content-Type"))
 	body, _ := ioutil.ReadAll(res.Body)
@@ -653,8 +663,8 @@ func TestAuthorizeFormSuccess(t *testing.T) {
 	req, _ := http.NewRequest("GET", ts.URL+"/auth/authorize?response_type=code&state=123456&scope=files:read&redirect_uri="+u+"&client_id="+clientID, nil)
 	req.Host = domain
 	res, err := client.Do(req)
-	defer res.Body.Close()
 	assert.NoError(t, err)
+	defer res.Body.Close()
 	assert.Equal(t, "200 OK", res.Status)
 	assert.Equal(t, "text/html; charset=UTF-8", res.Header.Get("Content-Type"))
 	body, _ := ioutil.ReadAll(res.Body)
@@ -679,8 +689,8 @@ func TestAuthorizeWhenNotLoggedIn(t *testing.T) {
 	req.Host = domain
 	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 	res, err := anonymousClient.Do(req)
-	defer res.Body.Close()
 	assert.NoError(t, err)
+	defer res.Body.Close()
 	assert.Equal(t, "403 Forbidden", res.Status)
 }
 
@@ -807,7 +817,7 @@ func TestAuthorizeSuccess(t *testing.T) {
 		couchdb.GetAllDocs(testInstance, consts.OAuthAccessCodes, req, &results)
 		if assert.Len(t, results, 1) {
 			code = results[0].Code
-			expected := fmt.Sprintf("https://example.org/oauth/callback?access_code=%s&state=123456#", code)
+			expected := fmt.Sprintf("https://example.org/oauth/callback?access_code=%s&client_id=%s&state=123456#", code, clientID)
 			assert.Equal(t, expected, res.Header.Get("Location"))
 			assert.Equal(t, results[0].ClientID, clientID)
 			assert.Equal(t, results[0].Scope, "files:read")
@@ -988,32 +998,157 @@ func TestLogoutNoToken(t *testing.T) {
 	res, err := client.Do(req)
 	assert.NoError(t, err)
 	defer res.Body.Close()
-	if assert.Equal(t, "303 See Other", res.Status) {
-		assert.Equal(t, "https://home.cozy.example.net/",
-			res.Header.Get("Location"))
-		cookies := jar.Cookies(instanceURL)
-		assert.Len(t, cookies, 2) // cozysessid and _csrf
-	}
+	assert.Equal(t, "401 Unauthorized", res.Status)
+	cookies := jar.Cookies(nil)
+	assert.Len(t, cookies, 2) // cozysessid and _csrf
 }
 
 func TestLogoutSuccess(t *testing.T) {
-	a := app.Manifest{Slug: "home"}
-	token := a.BuildToken(testInstance)
-	permissions.Create(testInstance, a.Slug, permissions.Set{})
+	a := app.WebappManifest{DocSlug: "home"}
+	token := testInstance.BuildAppToken(&a)
+	permissions.CreateAppSet(testInstance, a.Slug(), permissions.Set{})
 	req, _ := http.NewRequest("DELETE", ts.URL+"/auth/login", nil)
 	req.Host = domain
 	req.Header.Add("Authorization", "Bearer "+token)
 	res, err := client.Do(req)
 	assert.NoError(t, err)
 	defer res.Body.Close()
-	permissions.Destroy(testInstance, "home")
+	permissions.DestroyApp(testInstance, "home")
 
-	if assert.Equal(t, "303 See Other", res.Status) {
+	assert.Equal(t, "204 No Content", res.Status)
+	cookies := jar.Cookies(nil)
+	assert.Len(t, cookies, 1) // _csrf
+	assert.Equal(t, "_csrf", cookies[0].Name)
+}
+
+func TestPassphraseResetLoggedIn(t *testing.T) {
+	req, _ := http.NewRequest("GET", ts.URL+"/auth/passphrase_reset", nil)
+	req.Host = domain
+	res, err := client.Do(req)
+	if !assert.NoError(t, err) {
+		return
+	}
+	defer res.Body.Close()
+	assert.Equal(t, "200 OK", res.Status)
+	body, _ := ioutil.ReadAll(res.Body)
+	assert.Contains(t, string(body), `Are you sure`)
+	assert.Contains(t, string(body), `<input type="hidden" name="csrf_token"`)
+}
+
+func TestPassphraseReset(t *testing.T) {
+	req1, _ := http.NewRequest("GET", ts.URL+"/auth/passphrase_reset", nil)
+	req1.Host = domain
+	res1, err := client.Do(req1)
+	if !assert.NoError(t, err) {
+		return
+	}
+	defer res1.Body.Close()
+	assert.Equal(t, "200 OK", res1.Status)
+	csrfCookie := res1.Cookies()[0]
+	assert.Equal(t, "_csrf", csrfCookie.Name)
+	res2, err := postForm("/auth/passphrase_reset", &url.Values{
+		"csrf_token": {csrfCookie.Value},
+	})
+	if !assert.NoError(t, err) {
+		return
+	}
+	defer res2.Body.Close()
+	if assert.Equal(t, "303 See Other", res2.Status) {
 		assert.Equal(t, "https://cozy.example.net/auth/login",
-			res.Header.Get("Location"))
-		cookies := jar.Cookies(instanceURL)
-		assert.Len(t, cookies, 1) // _csrf
-		assert.Equal(t, "_csrf", cookies[0].Name)
+			res2.Header.Get("Location"))
+	}
+}
+
+func TestPassphraseRenewFormNoToken(t *testing.T) {
+	req, _ := http.NewRequest("GET", ts.URL+"/auth/passphrase_renew", nil)
+	req.Host = domain
+	res, err := client.Do(req)
+	if !assert.NoError(t, err) {
+		return
+	}
+	defer res.Body.Close()
+	assert.Equal(t, "400 Bad Request", res.Status)
+	body, _ := ioutil.ReadAll(res.Body)
+	assert.Contains(t, string(body), `{"error":"invalid_token"}`)
+}
+
+func TestPassphraseRenewFormBadToken(t *testing.T) {
+	req, _ := http.NewRequest("GET", ts.URL+"/auth/passphrase_renew?token=zzzz", nil)
+	req.Host = domain
+	res, err := client.Do(req)
+	if !assert.NoError(t, err) {
+		return
+	}
+	defer res.Body.Close()
+	assert.Equal(t, "400 Bad Request", res.Status)
+	body, _ := ioutil.ReadAll(res.Body)
+	assert.Contains(t, string(body), `{"error":"invalid_token"}`)
+}
+
+func TestPassphraseRenewFormWithToken(t *testing.T) {
+	req, _ := http.NewRequest("GET", ts.URL+"/auth/passphrase_renew?token=badbee", nil)
+	req.Host = domain
+	res, err := client.Do(req)
+	if !assert.NoError(t, err) {
+		return
+	}
+	defer res.Body.Close()
+	assert.Equal(t, "200 OK", res.Status)
+	body, _ := ioutil.ReadAll(res.Body)
+	assert.Contains(t, string(body), `type="hidden" name="passphrase_reset_token" value="badbee" />`)
+}
+
+func TestPassphraseRenew(t *testing.T) {
+	d := "test.cozycloud.cc.web_reset_form"
+	instance.Destroy(d)
+	in1, err := instance.Create(&instance.Options{
+		Domain: d,
+		Locale: "en",
+		Email:  "coucou@coucou.com",
+	})
+	if !assert.NoError(t, err) {
+		return
+	}
+	defer func() {
+		instance.Destroy(d)
+	}()
+	err = in1.RegisterPassphrase([]byte("MyPass"), in1.RegisterToken)
+	if !assert.NoError(t, err) {
+		return
+	}
+	req1, _ := http.NewRequest("GET", ts.URL+"/auth/passphrase_reset", nil)
+	req1.Host = domain
+	res1, err := client.Do(req1)
+	if !assert.NoError(t, err) {
+		return
+	}
+	defer res1.Body.Close()
+	csrfCookie := res1.Cookies()[0]
+	assert.Equal(t, "_csrf", csrfCookie.Name)
+	res2, err := postFormDomain(d, "/auth/passphrase_reset", &url.Values{
+		"csrf_token": {csrfCookie.Value},
+	})
+	if !assert.NoError(t, err) {
+		return
+	}
+	defer res2.Body.Close()
+	assert.Equal(t, "303 See Other", res2.Status)
+	in2, err := instance.Get(d)
+	if !assert.NoError(t, err) {
+		return
+	}
+	res3, err := postFormDomain(d, "/auth/passphrase_renew", &url.Values{
+		"passphrase_reset_token": {hex.EncodeToString(in2.PassphraseResetToken)},
+		"passphrase":             {"NewPassphrase"},
+		"csrf_token":             {csrfCookie.Value},
+	})
+	if !assert.NoError(t, err) {
+		return
+	}
+	defer res3.Body.Close()
+	if assert.Equal(t, "303 See Other", res3.Status) {
+		assert.Equal(t, "https://test.cozycloud.cc.web_reset_form/auth/login",
+			res3.Header.Get("Location"))
 	}
 }
 
@@ -1026,24 +1161,33 @@ func TestIsLoggedOutAfterLogout(t *testing.T) {
 func TestMain(m *testing.M) {
 	config.UseTestFile()
 	config.GetConfig().Assets = "../../assets"
-	instanceURL, _ = url.Parse("https://" + domain + "/")
-	j, _ := cookiejar.New(nil)
-	jar = &testJar{
-		Jar: j,
-	}
+	web.LoadSupportedLocales()
+	testutils.NeedCouchdb()
+	setup := testutils.NewSetup(m, "auth_test")
+
+	testInstance = setup.GetTestInstance(&instance.Options{Domain: domain})
+	testInstance.RegisterPassphrase([]byte("MyPassphrase"), testInstance.RegisterToken)
+
+	jar = setup.GetCookieJar()
 	client = &http.Client{
 		CheckRedirect: noRedirect,
 		Jar:           jar,
 	}
-	instance.Destroy(domain)
-	testInstance, _ = instance.Create(&instance.Options{
-		Domain: domain,
-		Locale: "en",
-	})
-	testInstance.RegisterPassphrase([]byte("MyPassphrase"), testInstance.RegisterToken)
 
-	r := echo.New()
-	r.GET("/test", func(c echo.Context) error {
+	ts = setup.GetTestServer("/test", fakeAPI, func(r *echo.Echo) *echo.Echo {
+		handler, err := web.CreateSubdomainProxy(r, apps.Serve)
+		if err != nil {
+			setup.CleanupAndDie("Cant start subdomain proxy", err)
+		}
+		return handler
+	})
+
+	os.Exit(setup.Run())
+}
+
+func fakeAPI(g *echo.Group) {
+	g.Use(middlewares.NeedInstance, middlewares.LoadSession)
+	g.GET("", func(c echo.Context) error {
 		var content string
 		if middlewares.IsLoggedIn(c) {
 			content = "logged_in"
@@ -1051,19 +1195,7 @@ func TestMain(m *testing.M) {
 			content = "who_are_you"
 		}
 		return c.String(http.StatusOK, content)
-	}, middlewares.NeedInstance, middlewares.LoadSession)
-
-	handler, err := web.CreateSubdomainProxy(r, apps.Serve)
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-
-	ts = httptest.NewServer(handler)
-	res := m.Run()
-	ts.Close()
-	instance.Destroy(domain)
-	os.Exit(res)
+	})
 }
 
 func noRedirect(*http.Request, []*http.Request) error {
@@ -1104,6 +1236,13 @@ func postForm(u string, v *url.Values) (*http.Response, error) {
 	return client.Do(req)
 }
 
+func postFormDomain(domain, u string, v *url.Values) (*http.Response, error) {
+	req, _ := http.NewRequest("POST", ts.URL+u, bytes.NewBufferString(v.Encode()))
+	req.Host = domain
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	return client.Do(req)
+}
+
 func putForm(u string, v *url.Values) (*http.Response, error) {
 	req, _ := http.NewRequest("PUT", ts.URL+u, bytes.NewBufferString(v.Encode()))
 	req.Host = domain
@@ -1115,10 +1254,10 @@ func getTestURL() (string, error) {
 	req, _ := http.NewRequest("GET", ts.URL+"/test", nil)
 	req.Host = domain
 	res, err := client.Do(req)
-	defer res.Body.Close()
 	if err != nil {
 		return "", err
 	}
+	defer res.Body.Close()
 	content, _ := ioutil.ReadAll(res.Body)
 	return string(content), nil
 }

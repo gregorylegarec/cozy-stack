@@ -124,8 +124,34 @@ this.
 
 ### Glossary
 
-Some technical terms have a special meaning in the cozy context. They are
-explained in [the glossary](glossary.md).
+#### Instance
+
+An instance is a logical space owned by a user and identified by a domain. For
+example, zoe.cozycloud.cc can be the cozy instance of Zoé. This instance has a
+space for storing files and some CouchDB databases for storing the documents
+of its owner.
+
+#### Environment
+
+When creating an instance, it's possible to give an environment, `dev`, `test`
+or `prod`. The default apps won't be the same on all environments. For
+example, in the `dev` environment, some devtools will be installed to help the
+front developers to create their own apps.
+
+#### Cozy Stack Build Mode
+
+The cozy stack can run in several modes, set by a UNIX environment variable:
+
+- `production`, the default
+- `development`, for coding on the cozy stack.
+
+This mode is set when compiling the cozy-stack. It is used to show more or
+less logs, and what is acceptable to be displayed in errors.
+
+Even if the Cozy Stack Build Mode and Environment have similar values, they
+are not the same. The Cozy Stack Mode will be used by core developers to hack
+on the cozy stack. The environment will be used by front developers to hack on
+cozy apps.
 
 
 ## Services
@@ -233,7 +259,7 @@ imported by the applications.
 The applications can put some notifications for the user. That goes from a
 reminder for a meeting in 10 minutes to a suggestion to update your app.
 
-### Real-time `/real-time`
+### Real-time `/realtime`
 
 This endpoint can be used to subscribe for real-time events. An application
 that shows items of a specific doctype can listen for this doctype to be
@@ -529,10 +555,8 @@ new language, or reviewing an existing one, is really appreciated.
 > Does the current konnectors in nodejs will be lost?
 
 No, they won't. The business logic to scrap data from the many sources will be
-kept and they will be adapted to fit in this new architecture. It won't be a
-daemonized http server anymore, just some node scripts. The Cozy Stack will
-listen for jobs for them and, then, will launch these nodejs scripts with the
-right parameters.
+kept and they will be adapted to fit in this new architecture. It is explained
+how we will do that [here](konnectors.md).
 
 > So, it's not possible to have a custom application with a server part, like
 the lounge IRC client?

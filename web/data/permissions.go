@@ -12,17 +12,26 @@ var readable = true
 var none = false
 
 var blackList = map[string]bool{
+	consts.Instances:        none,
 	consts.Sessions:         none,
 	consts.Permissions:      none,
+	consts.Intents:          none,
 	consts.OAuthClients:     none,
 	consts.OAuthAccessCodes: none,
+	consts.Archives:         none,
+	consts.Recipients:       none,
+	consts.Sharings:         none,
+	consts.Apps:             readable,
+	consts.Konnectors:       readable,
 	consts.Files:            readable,
-	consts.Instances:        readable,
+	consts.Jobs:             readable,
+	consts.Queues:           readable,
+	consts.Triggers:         readable,
 }
 
 // CheckReadable will abort the context and returns false if the doctype
 // is unreadable
-func CheckReadable(c echo.Context, doctype string) error {
+func CheckReadable(doctype string) error {
 	readable, inblacklist := blackList[doctype]
 	if !inblacklist || readable {
 		return nil
@@ -36,7 +45,7 @@ func CheckReadable(c echo.Context, doctype string) error {
 
 // CheckWritable will abort the echo context if the doctype
 // is unwritable
-func CheckWritable(c echo.Context, doctype string) error {
+func CheckWritable(doctype string) error {
 	_, inblacklist := blackList[doctype]
 	if !inblacklist {
 		return nil

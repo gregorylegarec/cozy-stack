@@ -7,7 +7,6 @@ import (
 	"net/http"
 
 	"github.com/cozy/cozy-stack/pkg/consts"
-	"github.com/cozy/cozy-stack/pkg/vfs"
 	"github.com/cozy/cozy-stack/web/jsonapi"
 	"github.com/cozy/cozy-stack/web/middlewares"
 	"github.com/cozy/cozy-stack/web/permissions"
@@ -15,7 +14,8 @@ import (
 )
 
 type apiDiskUsage struct {
-	Used int64 `json:"used,string"`
+	Used  int64 `json:"used,string"`
+	Quota int64 `json:"quota,string,omitempty"`
 }
 
 func (j *apiDiskUsage) ID() string                             { return consts.DiskUsageID }
@@ -36,15 +36,23 @@ func diskUsage(c echo.Context) error {
 	instance := middlewares.GetInstance(c)
 	var result apiDiskUsage
 
+	// Check permissions, but also allow every request from the logged-in user
+	// as this route is used by the cozy-bar from all the client-side apps
 	if err := permissions.Allow(c, permissions.GET, &result); err != nil {
-		return err
+		if !middlewares.IsLoggedIn(c) {
+			return err
+		}
 	}
 
-	used, err := vfs.DiskUsage(instance)
+	fs := instance.VFS()
+	used, err := fs.DiskUsage()
 	if err != nil {
 		return err
 	}
 
+	quota := fs.DiskQuota()
+
 	result.Used = used
+	result.Quota = quota
 	return jsonapi.Data(c, http.StatusOK, &result, nil)
 }

@@ -28,14 +28,7 @@ type LinksList struct {
 	Prev    string `json:"prev,omitempty"`
 	Next    string `json:"next,omitempty"`
 	Icon    string `json:"icon,omitempty"`
-}
-
-// ResourceIdentifier is an object, used in relationships, to identify an
-// individual resource
-// See http://jsonapi.org/format/#document-resource-identifier-objects
-type ResourceIdentifier struct {
-	ID   string `json:"id"`
-	Type string `json:"type"`
+	Perms   string `json:"permissions,omitempty"`
 }
 
 // Relationship is a resource linkage, as described in JSON-API
@@ -49,11 +42,11 @@ type Relationship struct {
 }
 
 // ResourceIdentifier returns the resource identifier of the relationship.
-func (r *Relationship) ResourceIdentifier() (*ResourceIdentifier, bool) {
+func (r *Relationship) ResourceIdentifier() (*couchdb.DocReference, bool) {
 	if m, ok := r.Data.(map[string]interface{}); ok {
 		idd, _ := m["id"].(string)
 		typ, _ := m["type"].(string)
-		return &ResourceIdentifier{ID: idd, Type: typ}, true
+		return &couchdb.DocReference{ID: idd, Type: typ}, true
 	}
 	return nil, false
 }

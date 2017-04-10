@@ -1,7 +1,9 @@
 package utils
 
 import (
+	"fmt"
 	"math/rand"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -29,17 +31,66 @@ func RandomString(n int) string {
 	return string(b)
 }
 
+// StripPort extract the domain name from a domain:port string.
+func StripPort(domain string) string {
+	if strings.Contains(domain, ":") {
+		cleaned, _, err := net.SplitHostPort(domain)
+		if err != nil {
+			return domain
+		}
+		return cleaned
+	}
+	return domain
+}
+
+// SplitTrimString slices s into all substrings a s separated by sep, like
+// strings.Split. In addition it will trim all those substrings and filter out
+// the empty ones.
+func SplitTrimString(s, sep string) []string {
+	if s == "" {
+		return []string{}
+	}
+	parts := strings.Split(s, ",")
+	filteredParts := parts[:0]
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			filteredParts = append(filteredParts, part)
+		}
+	}
+	return filteredParts
+}
+
 // FileExists returns whether or not the file exists on the current file
 // system.
 func FileExists(name string) (bool, error) {
-	_, err := os.Stat(name)
-	if err == nil {
-		return true, nil
+	infos, err := os.Stat(name)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
 	}
-	if os.IsNotExist(err) {
-		return false, nil
+	if infos.IsDir() {
+		return false, fmt.Errorf("Path %s is a directory", name)
 	}
-	return false, err
+	return true, nil
+}
+
+// DirExists returns whether or not the directory exists on the current file
+// system.
+func DirExists(name string) (bool, error) {
+	infos, err := os.Stat(name)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !infos.IsDir() {
+		return false, fmt.Errorf("Path %s is not a directory", name)
+	}
+	return true, nil
 }
 
 // UserHomeDir returns the user's home directory

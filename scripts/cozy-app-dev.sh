@@ -2,15 +2,12 @@
 
 set -e
 
-[ -z "${COZY_PROXY_HOST}" ] && COZY_PROXY_HOST="cozy.local"
-[ -z "${COZY_PROXY_PORT}" ] && COZY_PROXY_PORT="8080"
-[ -z "${COZY_STACK_HOST}" ] && COZY_STACK_HOST="localhost"
-[ -z "${COZY_STACK_PORT}" ] && COZY_STACK_PORT="8081"
+[ -z "${COZY_STACK_HOST}" ] && COZY_STACK_HOST="cozy.tools"
+[ -z "${COZY_STACK_PORT}" ] && COZY_STACK_PORT="8080"
 [ -z "${COZY_STACK_PASS}" ] && COZY_STACK_PASS="cozy"
-[ -z "${COUCHDB_PORT}" ] && COUCHDB_PORT="5984"
-[ -z "${COUCHDB_HOST}" ] && COUCHDB_HOST="localhost"
+[ -z "${COUCHDB_URL}" ] && COUCHDB_URL="http://localhost:5984/"
 
-if [ -d ${COZY_STACK_PATH} ] && [ -f ${COZY_STACK_PATH}/cozy-stack ]; then
+if [ -d "${COZY_STACK_PATH}" ] && [ -f "${COZY_STACK_PATH}/cozy-stack" ]; then
 	COZY_STACK_PATH="${COZY_STACK_PATH}/cozy-stack"
 fi
 
@@ -19,7 +16,7 @@ echo_err() {
 }
 
 real_path() {
-	[[ $1 = /* ]] && echo "$1" || echo "$PWD/${1#./}"
+	[[ "${1}" = /* ]] && echo "${1}" || echo "${PWD}/${1#./}"
 }
 
 usage() {
@@ -30,55 +27,28 @@ usage() {
 	echo -e "  -u try to update cozy-stack on start"
 	echo -e "  -h show this usage message"
 	echo -e "\nEnvironment variables"
-	echo -e "\n  COZY_PROXY_HOST"
-	echo -e "    specify the hostname or domain on which the proxy is listening"
-	echo -e "    to incoming requests. default: cozy.local"
-	echo -e "\n  COZY_PROXY_PORT"
-	echo -e "    specify the port on which the proxy is listening."
-	echo -e "    default: 8080."
 	echo -e "\n  COZY_STACK_PATH"
 	echo -e "    specify the path of the cozy-stack binary folder or the binary"
 	echo -e "    itself. default: \"\$GOPATH/bin\"."
 	echo -e "\n  COZY_STACK_HOST"
 	echo -e "    specify the hostname on which the cozy-stack is launched."
-	echo -e "    default: localhost."
+	echo -e "    default: cozy.tools."
 	echo -e "\n  COZY_STACK_PORT"
 	echo -e "    specify the port on which the cozy-stack is listening."
 	echo -e "    default: 8080."
 	echo -e "\n  COZY_STACK_PASS"
 	echo -e "    specify the password to register the instance with."
 	echo -e "    default: cozy."
-	echo -e "\n  COUCHDB_HOST"
-	echo -e "    specify the host of the couchdb database. if specified,"
-	echo -e "    the script won't try to start couchdb."
-	echo -e "\n  COUCHDB_PORT"
-	echo -e "    specify the port of the couchdb database. if specified,"
+	echo -e "\n  COUCHDB_URL"
+	echo -e "    specify the URL of the CouchDB database. If specified,"
 	echo -e "    the script won't try to start couchdb."
 }
 
-if [ "${COZY_STACK_PORT}" = "${COZY_PROXY_PORT}" ]; then
-	echo_err "COZY_STACK_HOST and COZY_PROXY_PORT are equal"
-	exit 1
-fi
-
 do_start() {
-	if [ -z "${COZY_PROXY_PATH}" ]; then
-		COZY_PROXY_PATH="${GOPATH}/bin/caddy"
-		if [ ! -f "${COZY_PROXY_PATH}" ]; then
-			if [ -z `command -v go` ]; then
-				echo_err "executable \"go\" not found in \$PATH"
-				exit 1
-			fi
-			printf "installing http server (caddy)... "
-			go get "github.com/mholt/caddy/caddy"
-			echo "ok"
-		fi
-	fi
-
 	if [ -z "${COZY_STACK_PATH}" ]; then
 		COZY_STACK_PATH="${GOPATH}/bin/cozy-stack"
 		if [ ! -f "${COZY_STACK_PATH}" ]; then
-			if [ -z `command -v go` ]; then
+			if [ -z "$(command -v go)" ]; then
 				echo_err "executable \"go\" not found in \$PATH"
 				exit 1
 			fi
@@ -99,58 +69,75 @@ do_start() {
 		echo "ok"
 	fi
 
-	trap "trap - SIGTERM && kill 2>&1 > /dev/null -- -${$}" SIGINT SIGTERM EXIT
+	trap 'trap - SIGTERM && kill 2>&1 > /dev/null -- -${$}' SIGINT SIGTERM EXIT
 
-	check_not_running ":${COZY_PROXY_PORT}" "proxy"
 	check_not_running ":${COZY_STACK_PORT}" "cozy-stack"
 	do_check_couchdb
-	do_start_proxy
-	check_hosts
+
+	if [ -f "${appdir}/manifest.webapp" ]; then
+		slug="app"
+	else
+		appsdir=""
+		for i in ${appdir}/*; do
+			if [ -f "${i}/manifest.webapp" ]; then
+				appsdir="${appsdir},$(basename "$i"):${i}"
+			fi
+			if [ -z "$slug" ]; then
+				slug=$(basename "$i")
+			fi
+		done
+		if [ -z "${appsdir}" ]; then
+			echo_err "No manifest found in ${appdir}"
+			exit 1
+		fi
+		appdir=${appsdir:1}
+	fi
+
 
 	echo "starting cozy-stack with ${vfsdir}..."
 
-	${COZY_STACK_PATH} serve \
+	${COZY_STACK_PATH} serve --allow-root \
+		--appdir "${appdir}" \
 		--host "${COZY_STACK_HOST}" \
 		--port "${COZY_STACK_PORT}" \
-		--couchdb-host "${COUCHDB_HOST}" \
-		--couchdb-port "${COUCHDB_PORT}" \
+		--couchdb-url "${COUCHDB_URL}" \
+		--mail-host "${COZY_STACK_HOST}" \
+		--mail-port 1025 \
+		--mail-disable-tls \
 		--fs-url "file://localhost${vfsdir}" &
 
 	wait_for "${COZY_STACK_HOST}:${COZY_STACK_PORT}/version/" "cozy-stack"
 
-	if [ "${COZY_PROXY_PORT}" = "80" ]; then
-		cozy_dev_addr="${COZY_PROXY_HOST}"
+	if [ "${COZY_STACK_PORT}" = "80" ]; then
+		cozy_dev_addr="${COZY_STACK_HOST}"
 	else
-		cozy_dev_addr="${COZY_PROXY_HOST}:${COZY_PROXY_PORT}"
+		cozy_dev_addr="${COZY_STACK_HOST}:${COZY_STACK_PORT}"
 	fi
-
 
 	echo ""
 	do_create_instances
 	echo ""
-	echo "Everything is setup. Go to http://app.${cozy_dev_addr}/"
+	echo "Everything is setup. Go to http://${slug}.${cozy_dev_addr}/"
 	echo "To exit, press ^C"
 	cat
 }
 
 do_check_couchdb() {
-	couchdb_addr="${COUCHDB_HOST}:${COUCHDB_PORT}"
-
 	printf "waiting for couchdb..."
-	wait_for "${couchdb_addr}" "couchdb"
+	wait_for "${COUCHDB_URL}" "couchdb"
 	echo "ok"
 
-	printf "checking couchdb on ${couchdb_addr}... "
-	couch_test=$(curl -s -XGET "${couchdb_addr}" || echo "")
+	printf "checking couchdb on %s... " "${COUCHDB_URL}"
+	couch_test=$(curl -s -XGET "${COUCHDB_URL}" || echo "")
 	couch_vers=$(grep "\"version\":\s*\"2" <<< "${couch_test}" || echo "")
 
 	if [ -z "${couch_test}" ]; then
 		echo "failed"
-		echo_err "could not reach couchdb on ${couchdb_addr}"
+		echo_err "could not reach couchdb on ${COUCHDB_URL}"
 		exit 1
 	elif [ -z "${couch_vers}" ]; then
 		echo "failed"
-		echo_err "couchdb v1 is running on ${couchdb_addr}"
+		echo_err "couchdb v1 is running on ${COUCHDB_URL}"
 		echo_err "you need couchdb version >= 2"
 		exit 1
 	fi
@@ -158,27 +145,31 @@ do_check_couchdb() {
 	echo "ok"
 
 	for dbname in "_users" "_replicator" "_global_changes"; do
-		curl -s -XPUT "${couchdb_addr}/${dbname}" > /dev/null
+		curl -s -XPUT "${COUCHDB_URL}/${dbname}" > /dev/null
 	done
 }
 
 do_create_instances() {
-	for host in "localhost:${COZY_PROXY_PORT}" "${cozy_dev_addr}"
+	for host in "${cozy_dev_addr}" "localhost:${COZY_STACK_PORT}"
 	do
-		printf "creating instance ${host}... "
+		printf "creating instance %s" "${host}"
+		if [ -n "${COZY_STACK_PASS}" ]; then
+			printf " using passphrase \"%s\"" "${COZY_STACK_PASS}"
+		fi
+		printf "... "
+
 		set +e
 		add_instance_val=$(
-			${COZY_STACK_PATH} instances add --dev="true" "${host}" \
-				--couchdb-host "${COUCHDB_HOST}" \
-				--couchdb-port "${COUCHDB_PORT}" \
+			${COZY_STACK_PATH} instances add \
+				--dev \
 				--email dev@cozy.io \
-				--fs-url "file://localhost${vfsdir}" 2>&1
+				--passphrase ${COZY_STACK_PASS} \
+				"${host}" 2>&1
 		)
 		add_instance_ret="${?}"
 		set -e
 		if [ "${add_instance_ret}" = "0" ]; then
 			echo "ok"
-			reg_token=$(grep 'token' <<< "${add_instance_val}" | sed 's/.*token: \\"\([A-Fa-f0-9]*\)\\".*/\1/g')
 		else
 			exists_test=$(grep -i "already exists" <<< "${add_instance_val}" || echo "")
 			if [ -z "${exists_test}" ]; then
@@ -187,47 +178,12 @@ do_create_instances() {
 			fi
 			echo "ok (already created)"
 		fi
-
-		if [ -n "${COZY_STACK_PASS}" ] && [ -n "${reg_token}" ]; then
-			printf "registering using passphrase ${COZY_STACK_PASS}... "
-			curl --fail -X POST -H 'Content-Type: application/json' \
-				"http://${host}/settings/passphrase" \
-				-d "{\"register_token\":\"${reg_token}\",\"passphrase\":\"${COZY_STACK_PASS}\"}"
-			echo "ok"
-		fi
 	done
-}
-
-do_start_proxy() {
-	site_root=$(real_path ${appdir})
-
-	caddy_file="\n\
-localhost, ${COZY_PROXY_HOST} {                   \n\
-  proxy / ${COZY_STACK_HOST}:${COZY_STACK_PORT} { \n\
-    transparent                                   \n\
-  }                                               \n\
-  tls off                                         \n\
-}                                                 \n\
-app.${COZY_PROXY_HOST} {                          \n\
-  root ${site_root}                               \n\
-  header / Cache-Control \"no-store\"             \n\
-  tls off                                         \n\
-  browse                                          \n\
-}                                                 \n\
-"
-
-	printf "starting caddy on \"${site_root}\"... "
-	echo -e ${caddy_file} | ${COZY_PROXY_PATH} \
-		-quiet \
-		-conf stdin \
-		-port ${COZY_PROXY_PORT} &
-	wait_for "${COZY_STACK_HOST}:${COZY_PROXY_PORT}" "caddy"
-	echo "ok"
 }
 
 wait_for() {
 	i="0"
-	while ! curl -s --max-time 0.1 -XGET ${1} > /dev/null; do
+	while ! LC_NUMERIC=C curl -s --max-time 0.1 -XGET "${1}" > /dev/null; do
 		sleep 0.1
 		i=$((i+1))
 		if [ "${i}" -gt "50" ]; then
@@ -238,24 +194,13 @@ wait_for() {
 }
 
 check_not_running() {
-	printf "checking ${2} on ${1}... "
-	if curl -s --max-time 1 -XGET ${1} > /dev/null; then
+	printf "checking that %s is free... " "${1}"
+	if curl -s --max-time 1 -XGET "${1}" > /dev/null; then
 		printf "\n"
 		echo_err "${2} is already running on ${1}"
 		exit 1
 	fi
 	echo "ok"
-}
-
-check_hosts() {
-	devhost=$(cat /etc/hosts | grep ${COZY_PROXY_HOST} || echo "")
-	apphost=$(cat /etc/hosts | grep app.${COZY_PROXY_HOST} || echo "")
-	if [ -z "${devhost}" ] || [ -z "${apphost}" ]; then
-		echo -e ""
-		echo -e "You should have the following line in your /etc/hosts file:"
-		echo -e "127.0.0.1\t${COZY_PROXY_HOST} app.${COZY_PROXY_HOST}"
-		echo -e ""
-	fi
 }
 
 update=false
@@ -297,7 +242,7 @@ if [ -z "${appdir}" ]; then
 	exit 1
 fi
 
-if [ ! -d ${appdir} ]; then
+if [ ! -d "${appdir}" ]; then
 	echo_err "Application directory ${1} does not exit"
 	exit 1
 fi

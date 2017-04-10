@@ -3,14 +3,11 @@ package apps
 import (
 	"testing"
 
-	"github.com/cozy/cozy-stack/pkg/crypto"
-	"github.com/cozy/cozy-stack/pkg/instance"
-	jwt "github.com/dgrijalva/jwt-go"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestFindRoute(t *testing.T) {
-	manifest := &Manifest{}
+	manifest := &WebappManifest{}
 	manifest.Routes = make(Routes)
 	manifest.Routes["/foo"] = Route{Folder: "/foo", Index: "index.html"}
 	manifest.Routes["/foo/bar"] = Route{Folder: "/bar", Index: "index.html"}
@@ -64,7 +61,7 @@ func TestFindRoute(t *testing.T) {
 }
 
 func TestNoRegression217(t *testing.T) {
-	var man Manifest
+	var man WebappManifest
 	man.Routes = make(Routes)
 	man.Routes["/"] = Route{
 		Folder: "/",
@@ -77,27 +74,55 @@ func TestNoRegression217(t *testing.T) {
 	assert.Equal(t, "any/path", rest)
 }
 
-func TestBuildToken(t *testing.T) {
-	manifest := &Manifest{
-		Slug: "my-app",
-	}
-	i := &instance.Instance{
-		Domain:        "test-ctx-token.example.com",
-		SessionSecret: crypto.GenerateRandomBytes(64),
-	}
+func TestFindIntent(t *testing.T) {
+	var man WebappManifest
+	found := man.FindIntent("PICK", "io.cozy.files")
+	assert.Nil(t, found)
 
-	tokenString := manifest.BuildToken(i)
-	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-		_, ok := token.Method.(*jwt.SigningMethodHMAC)
-		assert.True(t, ok, "The signing method should be HMAC")
-		return i.SessionSecret, nil
-	})
-	assert.NoError(t, err)
-	assert.True(t, token.Valid)
+	man.Intents = []Intent{
+		Intent{
+			Action: "PICK",
+			Types:  []string{"io.cozy.contacts", "io.cozy.calendars"},
+			Href:   "/pick",
+		},
+		Intent{
+			Action: "OPEN",
+			Types:  []string{"io.cozy.files", "image/gif"},
+			Href:   "/open",
+		},
+		Intent{
+			Action: "EDIT",
+			Types:  []string{"image/*"},
+			Href:   "/open",
+		},
+	}
+	found = man.FindIntent("PICK", "io.cozy.files")
+	assert.Nil(t, found)
+	found = man.FindIntent("OPEN", "io.cozy.contacts")
+	assert.Nil(t, found)
+	found = man.FindIntent("PICK", "io.cozy.contacts")
+	assert.NotNil(t, found)
+	assert.Equal(t, "PICK", found.Action)
+	found = man.FindIntent("OPEN", "io.cozy.files")
+	assert.NotNil(t, found)
+	assert.Equal(t, "OPEN", found.Action)
+	found = man.FindIntent("open", "io.cozy.files")
+	assert.NotNil(t, found)
+	assert.Equal(t, "OPEN", found.Action)
 
-	claims, ok := token.Claims.(jwt.MapClaims)
-	assert.True(t, ok, "Claims can be parsed as standard claims")
-	assert.Equal(t, "app", claims["aud"])
-	assert.Equal(t, "test-ctx-token.example.com", claims["iss"])
-	assert.Equal(t, "my-app", claims["sub"])
+	found = man.FindIntent("OPEN", "image/gif")
+	assert.NotNil(t, found)
+	assert.Equal(t, "OPEN", found.Action)
+	found = man.FindIntent("EDIT", "image/gif")
+	assert.NotNil(t, found)
+	assert.Equal(t, "EDIT", found.Action)
+
+	man.Intents = []Intent{
+		Intent{
+			Action: "PICK",
+			Href:   "/pick",
+		},
+	}
+	found = man.FindIntent("PICK", "io.cozy.files")
+	assert.Nil(t, found)
 }

@@ -172,10 +172,12 @@ Content-Type: application/vnd.api+json
 
 Returns all the files associated to an album or playlist.
 
+Contents is paginated following [jsonapi conventions](jsonapi.md#pagination). The default limit is 100 entries.
+
 #### Request
 
 ```http
-GET /files/io.cozy.playlists/e9308dc2-e2e3-11e6-b685-fb88662613d4/relationships/references HTTP/1.1
+GET /data/io.cozy.playlists/e9308dc2-e2e3-11e6-b685-fb88662613d4/relationships/references HTTP/1.1
 Content-Type: application/vnd.api+json
 Accept: application/vnd.api+json
 ```
@@ -206,7 +208,7 @@ for each file individually. This route allows to make it in bulk.
 #### Request
 
 ```http
-POST /files/io.cozy.playlists/e9308dc2-e2e3-11e6-b685-fb88662613d4/relationships/references HTTP/1.1
+POST /data/io.cozy.playlists/e9308dc2-e2e3-11e6-b685-fb88662613d4/relationships/references HTTP/1.1
 Content-Type: application/vnd.api+json
 Accept: application/vnd.api+json
 ```
@@ -240,7 +242,7 @@ playlist is deleted.
 #### Request
 
 ```http
-DELETE /files/io.cozy.playlists/e9308dc2-e2e3-11e6-b685-fb88662613d4/relationships/references HTTP/1.1
+DELETE /data/io.cozy.playlists/e9308dc2-e2e3-11e6-b685-fb88662613d4/relationships/references HTTP/1.1
 Content-Type: application/vnd.api+json
 Accept: application/vnd.api+json
 ```

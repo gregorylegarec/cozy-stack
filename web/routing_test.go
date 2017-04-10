@@ -7,14 +7,13 @@ import (
 	"testing"
 
 	"github.com/cozy/cozy-stack/pkg/config"
-	"github.com/cozy/cozy-stack/pkg/instance"
+	"github.com/cozy/cozy-stack/tests/testutils"
 	"github.com/cozy/cozy-stack/web/middlewares"
 	"github.com/labstack/echo"
 	"github.com/stretchr/testify/assert"
 )
 
-const domain = "cozy.example.net"
-
+var domain string
 var ts *httptest.Server
 
 func TestSetupAssets(t *testing.T) {
@@ -27,7 +26,8 @@ func TestSetupAssets(t *testing.T) {
 	ts := httptest.NewServer(e)
 	defer ts.Close()
 
-	res, _ := http.Get(ts.URL + "/assets/images/cozy.svg")
+	res, err := http.Get(ts.URL + "/assets/images/cozy.svg")
+	assert.NoError(t, err)
 	defer res.Body.Close()
 	assert.Equal(t, 200, res.StatusCode)
 }
@@ -42,7 +42,8 @@ func TestSetupAssetsStatik(t *testing.T) {
 	ts := httptest.NewServer(e)
 	defer ts.Close()
 
-	res, _ := http.Get(ts.URL + "/assets/images/cozy.svg")
+	res, err := http.Get(ts.URL + "/assets/images/cozy.svg")
+	assert.NoError(t, err)
 	defer res.Body.Close()
 	assert.Equal(t, 200, res.StatusCode)
 }
@@ -57,7 +58,8 @@ func TestSetupRoutes(t *testing.T) {
 	ts := httptest.NewServer(e)
 	defer ts.Close()
 
-	res, _ := http.Get(ts.URL + "/version")
+	res, err := http.Get(ts.URL + "/version")
+	assert.NoError(t, err)
 	defer res.Body.Close()
 	assert.Equal(t, 200, res.StatusCode)
 }
@@ -65,7 +67,7 @@ func TestSetupRoutes(t *testing.T) {
 func TestParseHost(t *testing.T) {
 	apis := echo.New()
 
-	apis.GET("/", func(c echo.Context) error {
+	apis.GET("/test", func(c echo.Context) error {
 		instance := middlewares.GetInstance(c)
 		assert.NotNil(t, instance, "the instance should have been set in the echo context")
 		return c.String(http.StatusOK, "OK")
@@ -81,7 +83,7 @@ func TestParseHost(t *testing.T) {
 	}
 
 	urls := map[string]string{
-		"https://" + domain + "/":        "OK",
+		"https://" + domain + "/test":    "OK",
 		"https://foo." + domain + "/app": "OK:foo",
 		"https://bar." + domain + "/app": "OK:bar",
 	}
@@ -98,12 +100,9 @@ func TestParseHost(t *testing.T) {
 func TestMain(m *testing.M) {
 	config.UseTestFile()
 	config.GetConfig().Assets = "../assets"
-	instance.Destroy(domain)
-	instance.Create(&instance.Options{
-		Domain: domain,
-		Locale: "en",
-	})
-	res := m.Run()
-	instance.Destroy(domain)
-	os.Exit(res)
+	testutils.NeedCouchdb()
+	setup := testutils.NewSetup(m, "routing_test")
+	inst := setup.GetTestInstance()
+	domain = inst.Domain
+	os.Exit(setup.Run())
 }

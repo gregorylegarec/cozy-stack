@@ -3,6 +3,7 @@
 package web
 
 import (
+	"fmt"
 	"html/template"
 	"io"
 	"io/ioutil"
@@ -18,10 +19,12 @@ import (
 	"github.com/cozy/cozy-stack/web/errors"
 	"github.com/cozy/cozy-stack/web/files"
 	"github.com/cozy/cozy-stack/web/instances"
+	"github.com/cozy/cozy-stack/web/intents"
 	"github.com/cozy/cozy-stack/web/jobs"
 	"github.com/cozy/cozy-stack/web/middlewares"
 	"github.com/cozy/cozy-stack/web/permissions"
 	"github.com/cozy/cozy-stack/web/settings"
+	"github.com/cozy/cozy-stack/web/sharings"
 	_ "github.com/cozy/cozy-stack/web/statik" // Generated file with the packed assets
 	"github.com/cozy/cozy-stack/web/status"
 	"github.com/cozy/cozy-stack/web/version"
@@ -37,6 +40,8 @@ var (
 		"authorize.html",
 		"error.html",
 		"login.html",
+		"passphrase_reset.html",
+		"passphrase_renew.html",
 	}
 )
 
@@ -46,7 +51,12 @@ type renderer struct {
 }
 
 func (r *renderer) Render(w io.Writer, name string, data interface{}, c echo.Context) error {
-	return r.t.ExecuteTemplate(w, name, data)
+	i := middlewares.GetInstance(c)
+	t, err := r.t.Clone()
+	if err != nil {
+		return err
+	}
+	return t.Funcs(template.FuncMap{"t": i.Translate}).ExecuteTemplate(w, name, data)
 }
 
 func newRenderer(assetsPath string) (*renderer, error) {
@@ -56,9 +66,10 @@ func newRenderer(assetsPath string) (*renderer, error) {
 		for i, name := range templatesList {
 			list[i] = path.Join(assetsPath, "templates", name)
 		}
-		t, err := template.ParseFiles(list...)
-		if err != nil {
-			return nil, err
+		var err error
+		t := template.New("stub").Funcs(template.FuncMap{"t": fmt.Sprintf})
+		if t, err = t.ParseFiles(list...); err != nil {
+			return nil, fmt.Errorf("Can't load the assets from %s", assetsPath)
 		}
 		h := http.FileServer(http.Dir(assetsPath))
 		r := &renderer{t, h}
@@ -78,16 +89,16 @@ func newRenderer(assetsPath string) (*renderer, error) {
 		} else {
 			tmpl = t.New(name)
 		}
+		tmpl = tmpl.Funcs(template.FuncMap{"t": fmt.Sprintf})
 		f, err := statikFS.Open("/templates/" + name)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("Can't load asset %s", name)
 		}
 		b, err := ioutil.ReadAll(f)
 		if err != nil {
 			return nil, err
 		}
-		_, err = tmpl.Parse(string(b))
-		if err != nil {
+		if _, err = tmpl.Parse(string(b)); err != nil {
 			return nil, err
 		}
 	}
@@ -103,7 +114,10 @@ func SetupAppsHandler(appsHandler echo.HandlerFunc) echo.HandlerFunc {
 	secure := middlewares.Secure(&middlewares.SecureConfig{
 		HSTSMaxAge:    hstsMaxAge,
 		CSPDefaultSrc: []middlewares.CSPSource{middlewares.CSPSrcSelf, middlewares.CSPSrcParent},
-		CSPFrameSrc:   []middlewares.CSPSource{middlewares.CSPSrcParent},
+		CSPStyleSrc:   []middlewares.CSPSource{middlewares.CSPSrcSelf, middlewares.CSPSrcParent, middlewares.CSPUnsafeInline},
+		CSPFontSrc:    []middlewares.CSPSource{middlewares.CSPSrcSelf, middlewares.CSPSrcData, middlewares.CSPSrcParent},
+		CSPImgSrc:     []middlewares.CSPSource{middlewares.CSPSrcSelf, middlewares.CSPSrcData, middlewares.CSPSrcBlob, middlewares.CSPSrcParent, middlewares.CSPSrcWhitelist},
+		CSPFrameSrc:   []middlewares.CSPSource{middlewares.CSPSrcSiblings},
 		XFrameOptions: middlewares.XFrameDeny,
 	})
 
@@ -130,6 +144,8 @@ func SetupRoutes(router *echo.Echo) error {
 	secure := middlewares.Secure(&middlewares.SecureConfig{
 		HSTSMaxAge:    hstsMaxAge,
 		CSPDefaultSrc: []middlewares.CSPSource{middlewares.CSPSrcSelf},
+		// Display logos of OAuth clients on the authorize page
+		CSPImgSrc:     []middlewares.CSPSource{middlewares.CSPSrcAny},
 		XFrameOptions: middlewares.XFrameDeny,
 	})
 
@@ -139,13 +155,17 @@ func SetupRoutes(router *echo.Echo) error {
 		middlewares.NeedInstance,
 		middlewares.LoadSession,
 	}
+	router.GET("/", auth.Home, mws...)
 	auth.Routes(router.Group("/auth", mws...))
-	apps.Routes(router.Group("/apps", mws...))
+	apps.WebappsRoutes(router.Group("/apps", mws...))
+	apps.KonnectorRoutes(router.Group("/konnectors", mws...))
 	data.Routes(router.Group("/data", mws...))
 	files.Routes(router.Group("/files", mws...))
+	intents.Routes(router.Group("/intents", mws...))
 	jobs.Routes(router.Group("/jobs", mws...))
 	permissions.Routes(router.Group("/permissions", mws...))
 	settings.Routes(router.Group("/settings", mws...))
+	sharings.Routes(router.Group("/sharings", mws...))
 	status.Routes(router.Group("/status"))
 	version.Routes(router.Group("/version"))
 
@@ -162,6 +182,7 @@ func SetupAdminRoutes(router *echo.Echo) error {
 	}
 
 	instances.Routes(router.Group("/instances"))
+	version.Routes(router.Group("/version"))
 
 	setupRecover(router)
 
@@ -186,7 +207,7 @@ func CreateSubdomainProxy(router *echo.Echo, serveApps echo.HandlerFunc) (*echo.
 	main := echo.New()
 	main.Any("/*", func(c echo.Context) error {
 		// TODO(optim): minimize the number of instance requests
-		if parent, slug := middlewares.SplitHost(c.Request().Host); slug != "" {
+		if parent, slug, _ := middlewares.SplitHost(c.Request().Host); slug != "" {
 			if i, err := instance.Get(parent); err == nil {
 				c.Set("instance", i)
 				c.Set("slug", slug)
@@ -204,10 +225,12 @@ func CreateSubdomainProxy(router *echo.Echo, serveApps echo.HandlerFunc) (*echo.
 
 // setupRecover sets a recovering strategy of panics happening in handlers
 func setupRecover(router *echo.Echo) {
-	recoverMiddleware := middleware.RecoverWithConfig(middleware.RecoverConfig{
-		StackSize:         1 << 10, // 1 KB
-		DisableStackAll:   !config.IsDevRelease(),
-		DisablePrintStack: !config.IsDevRelease(),
-	})
-	router.Use(recoverMiddleware)
+	if !config.IsDevRelease() {
+		recoverMiddleware := middleware.RecoverWithConfig(middleware.RecoverConfig{
+			StackSize:         1 << 10, // 1 KB
+			DisableStackAll:   true,
+			DisablePrintStack: true,
+		})
+		router.Use(recoverMiddleware)
+	}
 }

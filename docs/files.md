@@ -29,16 +29,23 @@ given, the directory is created at the root of the virtual file system.
 #### Query-String
 
 Parameter | Description
-----------|------------------
+----------|-------------------
 Type      | `directory`
 Name      | the directory name
 Tags      | an array of tags
+
+#### HTTP headers
+
+Parameter | Description
+----------|---------------------------------------
+Date      | The modification date of the directory
 
 #### Request
 
 ```http
 POST /files/fce1a6c0-dfc5-11e5-8d1a-1f854d4aaf81?Type=directory&Name=phone&Tags=bills,konnectors HTTP/1.1
 Accept: application/vnd.api+json
+Date: Mon, 19 Sep 2016 12:35:08 GMT
 ```
 
 #### Status codes
@@ -92,14 +99,8 @@ Location: http://cozy.example.com/files/6494e0ac-dfcb-11e5-88c1-472e84a9cbee
 ### GET /files/:file-id
 
 Get a directory or a file informations. In the case of a directory, it contains the list of files and sub-directories inside it.
-Contents is paginated. By default, only the 100 first entries are given.
 
-### Query-String
-
-Parameter    | Description
--------------|---------------------------------------
-page[cursor] | the last id of the results
-page[limit]  | the number of entries (100 by default)
+Contents is paginated following [jsonapi conventions](jsonapi.md#pagination). The default limit is 30 entries.
 
 #### Request
 
@@ -181,6 +182,7 @@ Content-Type: application/vnd.api+json
     "attributes": {
       "type": "file",
       "name": "hello.txt",
+      "hidden": false,
       "md5sum": "ODZmYjI2OWQxOTBkMmM4NQo=",
       "created_at": "2016-09-19T12:38:04Z",
       "updated_at": "2016-09-19T12:38:04Z",
@@ -278,11 +280,15 @@ Location: http://cozy.example.com/files/9152d568-7e7c-11e6-a377-37cbfb190b4b
     },
     "attributes": {
       "type": "file",
-      "name": "hello.txt",
+      "name": "hello.mp3",
+      "hidden": false,
       "md5sum": "ODZmYjI2OWQxOTBkMmM4NQo=",
       "created_at": "2016-09-19T12:38:04Z",
       "updated_at": "2016-09-19T12:38:04Z",
       "tags": [],
+      "metadata": {
+        "artist": "Adele"
+      },
       "size": 12,
       "executable": false,
       "class": "document",
@@ -324,6 +330,9 @@ more informations about the references field.
 
 Download the file content.
 
+By default the `content-disposition` will be `inline`, but it will be
+`attachment` if the query string contains the parameter `Dl=1`
+
 #### Request
 
 ```http
@@ -345,10 +354,13 @@ Hello world!
 
 Download the file content from its path.
 
+By default the `content-disposition` will be `inline`, but it will be
+`attachment` if the query string contains the parameter `Dl=1`
+
 #### Request
 
 ```http
-GET /files/download?Path=/Documents/hello.txt HTTP/1.1
+GET /files/download?Path=/Documents/hello.txt&Dl=1 HTTP/1.1
 ```
 
 ### GET /files/:file-id/thumbnail
@@ -403,6 +415,7 @@ Content-Type: application/vnd.api+json
     "attributes": {
       "type": "file",
       "name": "hello.txt",
+      "hidden": false,
       "md5sum": "YjU5YmMzN2Q2NDQxZDk2Nwo=",
       "created_at": "2016-09-19T12:38:04Z",
       "updated_at": "2016-09-19T12:38:04Z",
@@ -466,6 +479,7 @@ Location: http://cozy.example.com/files/9152d568-7e7c-11e6-a377-37cbfb190b4b
     "attributes": {
       "type": "file",
       "name": "hello.txt",
+      "hidden": false,
       "md5sum": "ODZmYjI2OWQxOTBkMmM4NQo=",
       "created_at": "2016-09-19T12:38:04Z",
       "updated_at": "2016-09-19T12:38:04Z",
@@ -522,6 +536,7 @@ Content-Type: application/vnd.api+json
     "attributes": {
       "type": "file",
       "name": "hi.txt",
+      "hidden": false,
       "tags": ["poem"]
     },
     "relationships": {
@@ -563,6 +578,7 @@ Location: http://cozy.example.com/files/9152d568-7e7c-11e6-a377-37cbfb190b4b
     "attributes": {
       "type": "file",
       "name": "hi.txt",
+      "hidden": false,
       "md5sum": "ODZmYjI2OWQxOTBkMmM4NQo=",
       "created_at": "2016-09-19T12:38:04Z",
       "updated_at": "2016-09-19T12:38:04Z",
@@ -641,14 +657,15 @@ Content-Type: application/vnd.api+json
 
 ### GET /files/archive/:key/:name
 
-Download a previously created archive. The name parameter is not used in
-the stack but aims to allow setting a name even for browser / downloader that do not support Content-Disposition filename.
+Download a previously created archive. The name parameter is not used in the
+stack but aims to allow setting a name even for browser / downloader that do
+not support Content-Disposition filename.
 
 **This route does not require Basic Authentification**
 
 
 ```http
-GET /files/archive/4521DC87 HTTP/1.1
+GET /files/archive/4521DC87/project-X.zip HTTP/1.1
 Accept: application/zip
 Content-Length: 12345
 Content-Disposition: attachment; filename="project-X.zip"
@@ -660,11 +677,20 @@ Content-Type: application/zip
 Create a file download. The Path query parameter specifies the file to download.
 The response json API links contains a `related` link for downloading the file, see below.
 
+### POST /files/downloads?Id=file_id
+
+Also create a file download. But it takes the id of the file and not its path.
+
 ### GET /files/downloads/:secret/:name
 
 Allows to download a file with a secret created from the route above.
 
-The name parameter is not used in the stack but aims to allow setting a name even for browser / downloader that do not support Content-Disposition filename.
+The name parameter is not used in the stack but aims to allow setting a name
+even for browser / downloader that do not support Content-Disposition
+filename.
+
+By default the `content-disposition` will be `inline`, but it will be
+`attachment` if the query string contains the parameter `Dl=1`
 
 **This route does not require Basic Authentification**
 
@@ -675,6 +701,8 @@ When a file is deleted, it is first moved to the trash. In the trash, it can
 be restored. Or, after some time, it will be removed from the trash and
 permanently destroyed.
 
+The file `hidden` attribute will be set to true.
+
 ### GET /files/trash
 
 List the files inside the trash. It's paginated.
@@ -682,9 +710,9 @@ List the files inside the trash. It's paginated.
 ### Query-String
 
 Parameter    | Description
--------------|---------------------------------------
+-------------|--------------------------------------
 page[cursor] | the last id of the results
-page[limit]  | the number of entries (100 by default)
+page[limit]  | the number of entries (30 by default)
 
 #### Request
 
@@ -711,6 +739,7 @@ Content-Type: application/vnd.api+json
     "attributes": {
       "type": "file",
       "name": "foo.txt",
+      "hidden": true,
       "md5sum": "YjAxMzQxZTc4MDNjODAwYwo=",
       "created_at": "2016-09-19T12:38:04Z",
       "updated_at": "2016-09-19T12:38:04Z",
@@ -732,6 +761,7 @@ Content-Type: application/vnd.api+json
     "attributes": {
       "type": "file",
       "name": "bar.txt",
+      "hidden": true,
       "md5sum": "YWVhYjg3ZWI0OWQzZjRlMAo=",
       "created_at": "2016-09-19T12:38:04Z",
       "updated_at": "2016-09-19T12:38:04Z",
@@ -752,6 +782,8 @@ Content-Type: application/vnd.api+json
 
 Restore the file with the `file-id` identifiant.
 
+The file's `hidden` attributes will be set to false.
+
 ### DELETE /files/trash/:file-id
 
 Destroy the file and make it unrecoverable (it will still be available in
@@ -760,3 +792,11 @@ backups).
 ### DELETE /files/trash
 
 Clear out the trash.
+
+
+## Hidden attribute
+
+All files that are inside a hidden folder will have a `hidden: true` attribute.
+This attribute can be used in mango queries to only get "interesting" files, for instance avoid applications icons poping up in Photo app.
+
+For now, only hidden folders are `.cozy_apps` & `trash`.

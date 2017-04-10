@@ -34,6 +34,7 @@ default_locale | the locale used for the name and description fields
 locales        | translations of the name and description fields in other locales
 version        | the current version number
 license        | [the SPDX license identifier](https://spdx.org/licenses/)
+intents        | a list of intents provided by this app (see [here](intents.md) for more details)
 permissions    | a map of permissions needed by the app (see [here](permissions.md) for more details)
 routes         | a map of routes for the app (see below for more details)
 
@@ -83,24 +84,6 @@ route, this default one:
 }
 ```
 
-**TODO** later, it will be possible to associate an intent /
-[activity](https://developer.mozilla.org/en-US/docs/Archive/Firefox_OS/Firefox_OS_apps/Building_apps_for_Firefox_OS/Manifest#activities)
-to a route. Probably something like:
-
-```json
-{
-  "/picker": {
-    "folder": "/",
-    "index": "picker.html",
-    "public": false,
-    "intent": {
-      "action": "pick",
-      "type": "io.cozy.contacts"
-    }
-  }
-}
-```
-
 ### GET /apps/manifests
 
 Give access to the manifest for an application. It can have several usages,
@@ -131,7 +114,7 @@ Content-Type: application/vnd.api+json
 ```json
 {
   "data": {
-    "type": "io.cozy.manifests",
+    "type": "io.cozy.apps",
     "id": "git://github.com/cozy/cozy-emails",
     "attributes": {
       "name": "cozy-emails",
@@ -156,6 +139,13 @@ Content-Type: application/vnd.api+json
       },
       "version": "1.2.3",
       "license": "AGPL-3.0",
+      "intents": [
+        {
+          "action": "CREATE",
+          "type": "io.cozy.emails",
+          "href": "/compose"
+        }
+      ],
       "permissions": {
         "mails": {
           "description": "Required for reading and writing emails",
@@ -182,11 +172,11 @@ Content-Type: application/vnd.api+json
 
 ### POST /apps/:slug
 
-Install or update an application, ie download the files and put them in
-`/apps/:slug` in the virtual file system of the user, create an `io.cozy/apps`
-document, register the permissions, etc.
+Install an application, ie download the files and put them in `/apps/:slug` in the virtual file system of the user, create an `io.cozy.apps` document, register the permissions, etc.
 
 This endpoint is asynchronous and returns a successful return as soon as the application installation has started, meaning we have successfully reached the manifest and started to fetch application data.
+
+To make this endpoint synchronous, use the header `Accept: text/event-stream`. This will make a eventsource stream sending the manifest and returning when the application has been installed or failed.
 
 #### Status codes
 
@@ -204,7 +194,7 @@ Source    | URL from where the app can be downloaded (only for install)
 #### Request
 
 ```http
-POST /apps/emails?Source=git://github.com/cozy/cozy-emails HTTP/1.1
+POST /apps/emails?Source=git://github.com/cozy/cozy-emails.git HTTP/1.1
 Accept: application/vnd.api+json
 ```
 
@@ -219,7 +209,7 @@ Content-Type: application/vnd.api+json
 {
   "data": [{
     "id": "4cfbd8be-8968-11e6-9708-ef55b7c20863",
-    "type": "io.cozy.applications",
+    "type": "io.cozy.apps",
     "meta": {
       "rev": "1-7a1f918147df94580c92b47275e4604a"
     },
@@ -236,6 +226,62 @@ Content-Type: application/vnd.api+json
 }
 ```
 
+**Note**: it's possible to choose a git branch by passing it in the fragment
+like this:
+
+```http
+POST /apps/emails-dev?Source=git://github.com/cozy/cozy-emails.git%23dev HTTP/1.1
+```
+
+### PUT /apps/:slug
+
+Update an application with the specified slug name.
+
+This endpoint is asynchronous and returns a successful return as soon as the application installation has started, meaning we have successfully reached the manifest and started to fetch application data.
+
+To make this endpoint synchronous, use the header `Accept: text/event-stream`. This will make a eventsource stream sending the manifest and returning when the application has been updated or failed.
+
+#### Request
+
+```http
+PUT /apps/emails HTTP/1.1
+Accept: application/vnd.api+json
+```
+
+#### Response
+
+```http
+HTTP/1.1 202 Accepted
+Content-Type: application/vnd.api+json
+```
+
+```json
+{
+  "data": [{
+    "id": "4cfbd8be-8968-11e6-9708-ef55b7c20863",
+    "type": "io.cozy.apps",
+    "meta": {
+      "rev": "1-7a1f918147df94580c92b47275e4604a"
+    },
+    "attributes": {
+      "name": "calendar",
+      "state": "installing",
+      "slug": "calendar",
+      ...
+    },
+    "links": {
+      "self": "/apps/calendar"
+    }
+  }]
+}
+```
+
+#### Status codes
+
+* 202 Accepted, when the application installation has been accepted.
+* 400 Bad-Request, when the manifest of the application could not be processed (for instance, it is not valid JSON).
+* 404 Not Found, when the application with the specified slug was not found or when the manifest or the source of the application is not reachable.
+* 422 Unprocessable Entity, when the sent data is invalid (for example, the slug is invalid or the Source parameter is not a proper or supported url)
 
 ## List installed applications
 
@@ -267,7 +313,7 @@ Content-Type: application/vnd.api+json
 {
   "data": [{
     "id": "4cfbd8be-8968-11e6-9708-ef55b7c20863",
-    "type": "io.cozy.applications",
+    "type": "io.cozy.apps",
     "meta": {
       "rev": "2-bbfb0fc32dfcdb5333b28934f195b96a"
     },
@@ -279,11 +325,37 @@ Content-Type: application/vnd.api+json
     },
     "links": {
       "self": "/apps/calendar",
-      "related": "https://calendar.alice.example.com/",
-      "icon": "https://calendar.alice.example.com/icon.svg"
+      "icon": "/apps/calendar/icon",
+      "related": "https://calendar.alice.example.com/"
     }
   }]
 }
+```
+
+
+## Get the icon of an application
+
+### GET /apps/:slug/icon
+
+#### Request
+
+```http
+GET /apps/calendar/icon HTTP/1.1
+```
+
+#### Response
+
+```http
+HTTP/1.1 200 OK
+Content-Type: image/svg+xml
+```
+
+```svg
+<svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 60 60">
+<title>Calendar</title>
+<path fill="#fff" fill-opacity=".011" d="M30 58.75c15.878 0 28.75-12.872 28.75-28.75s-12.872-28.75-28.75-28.75-28.75 12.872-28.75 28.75 12.872 28.75 28.75 28.75zm0 1.25c-16.569 0-30-13.432-30-30 0-16.569 13.431-30 30-30 16.568 0 30 13.431 30 30 0 16.568-13.432 30-30 30z"/>
+<path d="M47.997 9h-35.993c-1.654 0-3.004 1.345-3.004 3.004v35.993c0 1.653 1.345 3.004 3.004 3.004h35.993c1.653 0 3.004-1.345 3.004-3.004v-35.993c0-1.654-1.345-3.004-3.004-3.004zm-35.997 3.035h4.148v2.257c0 .856.7 1.556 1.556 1.556s1.556-.7 1.556-1.556v-2.257h5.136v2.257c0 .856.7 1.556 1.556 1.556s1.556-.7 1.556-1.556v-2.257h5.137v2.257c0 .856.699 1.556 1.556 1.556s1.556-.7 1.556-1.556v-2.257h5.137v2.257c0 .856.699 1.556 1.556 1.556s1.556-.7 1.556-1.556v-2.257h3.992v6.965h-35.998v-6.965zm36 35.965h-36v-27h36v27zm-21.71-10.15c-.433.34-.997.51-1.69.51-.64 0-1.207-.137-1.7-.409-.493-.273-.933-.603-1.32-.99l-1.1 1.479c.453.508 1.027.934 1.72 1.28.693.347 1.56.521 2.6.521.613 0 1.19-.083 1.73-.25.54-.167 1.013-.407 1.42-.721.407-.312.727-.696.96-1.149.233-.453.35-.974.35-1.56 0-.841-.25-1.527-.75-2.061s-1.13-.9-1.89-1.1v-.08c.693-.268 1.237-.641 1.63-1.12.393-.48.59-1.08.59-1.8 0-.533-.1-1.01-.3-1.43-.2-.42-.48-.772-.84-1.06-.36-.287-.793-.503-1.3-.65-.507-.147-1.067-.22-1.68-.22-.76 0-1.45.147-2.07.44s-1.203.68-1.75 1.16l1.18 1.42c.387-.36.783-.65 1.19-.87.407-.22.863-.33 1.37-.33.587 0 1.047.15 1.38.45.333.3.5.717.5 1.25 0 .293-.057.566-.17.819-.113.253-.3.47-.56.65-.26.18-.6.319-1.02.42-.42.1-.943.149-1.57.149v1.681c.72 0 1.32.05 1.8.149.48.101.863.243 1.15.43.287.188.49.414.61.681.12.267.18.567.18.899 0 .602-.217 1.072-.65 1.412zm13.71.15h-3v-11h-2c-.4.24-.65.723-1.109.89-.461.167-1.25.49-1.891.61v1.5h3v8h-3v2h8v-2z"/>
+</svg>
 ```
 
 
@@ -310,7 +382,7 @@ Content-Type: application/vnd.api+json
 ```json
 {
   "data": {
-    "type": "io.cozy.manifests",
+    "type": "io.cozy.apps",
     "attributes": {
       "name": "cozy-emails",
       "slug": "emails",
@@ -340,7 +412,7 @@ Content-Type: application/vnd.api+json
 {
   "data": {
     "id": "4f6436ce-8967-11e6-b174-ab83adac69f2",
-    "type": "io.cozy.manifests",
+    "type": "io.cozy.apps",
     "attributes": {
       "name": "cozy-emails",
       "slug": "emails",

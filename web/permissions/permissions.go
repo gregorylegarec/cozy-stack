@@ -1,17 +1,15 @@
 package permissions
 
 import (
-	"crypto/subtle"
-	"encoding/hex"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
 
-	"github.com/cozy/cozy-stack/pkg/consts"
+	"github.com/cozy/cozy-stack/pkg/couchdb"
 	"github.com/cozy/cozy-stack/pkg/crypto"
-	"github.com/cozy/cozy-stack/pkg/instance"
 	"github.com/cozy/cozy-stack/pkg/permissions"
+	"github.com/cozy/cozy-stack/web/jsonapi"
 	"github.com/cozy/cozy-stack/web/middlewares"
 	"github.com/labstack/echo"
 	jwt "gopkg.in/dgrijalva/jwt-go.v3"
@@ -27,43 +25,13 @@ var (
 	DELETE = permissions.DELETE
 )
 
-// keyPicker choose the proper instance key depending on token audience
-func keyPicker(i *instance.Instance) jwt.Keyfunc {
-	return func(token *jwt.Token) (interface{}, error) {
-		switch token.Claims.(*permissions.Claims).Audience {
-		case permissions.AppAudience:
-			return i.SessionSecret, nil
-		case permissions.RefreshTokenAudience, permissions.AccessTokenAudience:
-			return i.OAuthSecret, nil
-		}
-		return nil, permissions.ErrInvalidAudience
-	}
-}
+// ErrPatchCodeOrSet is returned when an attempt is made to patch both
+// code & set in one request
+var ErrPatchCodeOrSet = echo.NewHTTPError(http.StatusBadRequest,
+	"The patch doc should have property 'codes' or 'permissions', not both")
 
-const bearerAuthScheme = "Bearer "
-
-// ErrNoToken is returned whe the request has no token
-var ErrNoToken = errors.New("No token in request")
-
-var registerTokenPermissions = permissions.Set{
-	permissions.Rule{
-		Verbs:  permissions.Verbs(GET),
-		Type:   consts.Settings,
-		Values: []string{consts.InstanceSettingsID},
-	},
-}
-
-func getBearerToken(c echo.Context) string {
-	header := c.Request().Header.Get(echo.HeaderAuthorization)
-	if strings.HasPrefix(header, bearerAuthScheme) {
-		return header[len(bearerAuthScheme):]
-	}
-	return ""
-}
-
-func getQueryToken(c echo.Context) string {
-	return c.QueryParam("bearer_token")
-}
+// ErrForbidden is returned when a bad operation is attempted on permissions
+var ErrForbidden = echo.NewHTTPError(http.StatusForbidden)
 
 // ContextPermissionSet is the key used in echo context to store permissions set
 const ContextPermissionSet = "permissions_set"
@@ -72,167 +40,247 @@ const ContextPermissionSet = "permissions_set"
 // #nosec
 const ContextClaims = "token_claims"
 
-// Extractor extracts the permission set from the context
-func Extractor(next echo.HandlerFunc) echo.HandlerFunc {
-	return func(c echo.Context) error {
-
-		_, _, err := extract(c)
-		// if no token is provided, we call next anyway,
-		// hopefully the next handler does not need permissions
-		if err != nil && err != ErrNoToken {
-			return err
-		}
-
-		return next(c)
-	}
+type apiPermission struct {
+	*permissions.Permission
 }
 
-func extractJWTClaims(c echo.Context, instance *instance.Instance) (*permissions.Claims, error) {
-	var claims permissions.Claims
-	var err error
-	if token := getBearerToken(c); token != "" {
-		err = crypto.ParseJWT(token, keyPicker(instance), &claims)
-	} else if token := getQueryToken(c); token != "" {
-		err = crypto.ParseJWT(token, keyPicker(instance), &claims)
-	} else {
-		return nil, ErrNoToken
-	}
-
-	if claims.Issuer != instance.Domain {
-		// invalid issuer in token
-		return nil, permissions.ErrInvalidToken
-	}
-
-	return &claims, err
+func (p *apiPermission) MarshalJSON() ([]byte, error) {
+	return json.Marshal(p.Permission)
 }
 
-func extractPermissionSet(c echo.Context, instance *instance.Instance, claims *permissions.Claims) (*permissions.Set, error) {
+// Relationships implements jsonapi.Doc
+func (p *apiPermission) Relationships() jsonapi.RelationshipMap { return nil }
 
-	if claims == nil && hasRegisterToken(c, instance) {
-		return &registerTokenPermissions, nil
-	}
+// Included implements jsonapi.Doc
+func (p *apiPermission) Included() []jsonapi.Object { return nil }
 
-	if claims == nil {
-		return nil, ErrNoToken
-	}
-
-	if claims.Audience == permissions.AppAudience {
-		// app token, fetch permissions from couchdb
-		pdoc, err := permissions.GetForApp(instance, claims.Subject)
-		if err != nil {
-			return nil, err
-		}
-		return &pdoc.Permissions, nil
-	}
-
-	if claims.Audience == permissions.AccessTokenAudience {
-		// Oauth token, extract permissions from JWT-encoded scope
-		return permissions.UnmarshalScopeString(claims.Scope)
-	}
-
-	return nil, fmt.Errorf("Unrecognized token audience %v", claims.Audience)
-
-}
-
-func extract(c echo.Context) (*permissions.Claims, *permissions.Set, error) {
-	instance := middlewares.GetInstance(c)
-
-	claims, err := extractJWTClaims(c, instance)
-	if err != nil && err != ErrNoToken {
-		return nil, nil, err
-	}
-
-	pset, err := extractPermissionSet(c, instance, claims)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	c.Set(ContextClaims, claims)
-	c.Set(ContextPermissionSet, pset)
-
-	return claims, pset, err
-}
-
-func getPermission(c echo.Context) (*permissions.Set, error) {
-
-	s, ok := c.Get(ContextPermissionSet).(permissions.Set)
-	if ok {
-		return &s, nil
-	}
-
-	_, set, err := extract(c)
-	if err != nil {
-		return nil, echo.NewHTTPError(http.StatusUnauthorized)
-	}
-
-	return set, nil
-}
-
-// AllowWholeType validates that the context permission set can use a verb on
-// the whold doctype
-func AllowWholeType(c echo.Context, v permissions.Verb, doctype string) error {
-	pset, err := getPermission(c)
-	if err != nil {
-		return err
-	}
-
-	if !pset.AllowWholeType(v, doctype) {
-		return echo.NewHTTPError(http.StatusForbidden)
-	}
-	return nil
-}
-
-// Allow validates the validable object against the context permission set
-func Allow(c echo.Context, v permissions.Verb, o permissions.Validable) error {
-	pset, err := getPermission(c)
-	if err != nil {
-		return err
-	}
-
-	if !pset.Allow(v, o) {
-		return echo.NewHTTPError(http.StatusForbidden)
-	}
-	return nil
-}
-
-// AllowTypeAndID validates a type & ID against the context permission set
-func AllowTypeAndID(c echo.Context, v permissions.Verb, doctype, id string) error {
-	pset, err := getPermission(c)
-	if err != nil {
-		return err
-	}
-	if !pset.AllowID(v, doctype, id) {
-		return echo.NewHTTPError(http.StatusForbidden)
-	}
-	return nil
+// Links implements jsonapi.Doc
+func (p *apiPermission) Links() *jsonapi.LinksList {
+	return &jsonapi.LinksList{Self: "/permissions/" + p.PID}
 }
 
 func displayPermissions(c echo.Context) error {
-	set, err := getPermission(c)
+	doc, err := GetPermission(c)
+
 	if err != nil {
 		return err
 	}
-	return c.JSON(200, set)
+	return c.JSON(http.StatusOK, doc.Permissions)
 }
 
-func hasRegisterToken(c echo.Context, i *instance.Instance) bool {
-	hexToken := c.QueryParam("registerToken")
-	expectedTok := i.RegisterToken
-
-	if hexToken == "" || len(expectedTok) == 0 {
-		return false
-	}
-
-	tok, err := hex.DecodeString(hexToken)
+func createPermission(c echo.Context) error {
+	instance := middlewares.GetInstance(c)
+	names := strings.Split(c.QueryParam("codes"), ",")
+	parent, err := GetPermission(c)
 	if err != nil {
-		return false
+		return err
 	}
 
-	return subtle.ConstantTimeCompare(tok, expectedTok) == 1
+	var subdoc permissions.Permission
+	if _, err = jsonapi.Bind(c.Request(), &subdoc); err != nil {
+		return err
+	}
+
+	var codes map[string]string
+	if names != nil {
+		codes = make(map[string]string, len(names))
+		for _, name := range names {
+			codes[name], err = crypto.NewJWT(instance.OAuthSecret, &permissions.Claims{
+				StandardClaims: jwt.StandardClaims{
+					Audience: permissions.ShareAudience,
+					Issuer:   instance.Domain,
+					IssuedAt: crypto.Timestamp(),
+					Subject:  name,
+				},
+				Scope: "",
+			})
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	if parent == nil {
+		return echo.NewHTTPError(http.StatusUnauthorized, "no parent")
+	}
+
+	pdoc, err := permissions.CreateShareSet(instance, parent, codes, subdoc.Permissions)
+	if err != nil {
+		return err
+	}
+
+	return jsonapi.Data(c, http.StatusOK, &apiPermission{pdoc}, nil)
 }
 
-// Routes sets the routing for the status service
+type refAndVerb struct {
+	ID      string               `json:"id"`
+	DocType string               `json:"type"`
+	Verbs   *permissions.VerbSet `json:"verbs"`
+}
+
+const limitPermissionsByDoctype = 30
+
+func listPermissionsByDoctype(c echo.Context) error {
+	instance := middlewares.GetInstance(c)
+	doctype := c.Param("doctype")
+	current, err := GetPermission(c)
+	if err != nil {
+		return err
+	}
+
+	if !current.Permissions.AllowWholeType("GET", doctype) {
+		return jsonapi.NewError(http.StatusForbidden,
+			"you need GET permission on whole type to list its permissions")
+	}
+
+	cursor, err := jsonapi.ExtractPaginationCursor(c, limitPermissionsByDoctype)
+	if err != nil {
+		return err
+	}
+
+	perms, err := permissions.GetPermissionsByType(instance, doctype, cursor)
+	if err != nil {
+		return err
+	}
+
+	links := &jsonapi.LinksList{}
+	if !cursor.Done {
+		params, err := jsonapi.PaginationCursorToParams(cursor)
+		if err != nil {
+			return err
+		}
+		links.Next = fmt.Sprintf("/permissions/doctype/%s?%s", doctype, params.Encode())
+	}
+
+	out := make([]jsonapi.Object, len(perms))
+	for i, p := range perms {
+		out[i] = &apiPermission{p}
+	}
+
+	return jsonapi.DataList(c, http.StatusOK, out, links)
+}
+
+func listPermissions(c echo.Context) error {
+	instance := middlewares.GetInstance(c)
+
+	references, err := jsonapi.BindRelations(c.Request())
+	if err != nil {
+		return err
+	}
+	ids := make(map[string][]string)
+	for _, ref := range references {
+		idSlice, ok := ids[ref.Type]
+		if !ok {
+			idSlice = []string{}
+		}
+		ids[ref.Type] = append(idSlice, ref.ID)
+	}
+
+	var out []refAndVerb
+	for doctype, idSlice := range ids {
+		result, err2 := permissions.GetPermissionsForIDs(instance, doctype, idSlice)
+		if err2 != nil {
+			return err2
+		}
+		for id, verbs := range result {
+			out = append(out, refAndVerb{id, doctype, verbs})
+		}
+	}
+
+	data, err := json.Marshal(out)
+	if err != nil {
+		return err
+	}
+	doc := jsonapi.Document{
+		Data: (*json.RawMessage)(&data),
+	}
+	resp := c.Response()
+	resp.Header().Set("Content-Type", jsonapi.ContentType)
+	resp.WriteHeader(http.StatusOK)
+	return json.NewEncoder(resp).Encode(doc)
+}
+
+func patchPermission(c echo.Context) error {
+	instance := middlewares.GetInstance(c)
+	current, err := GetPermission(c)
+	if err != nil {
+		return err
+	}
+
+	var patch permissions.Permission
+	if _, err = jsonapi.Bind(c.Request(), &patch); err != nil {
+		return err
+	}
+
+	patchSet := patch.Permissions != nil && len(patch.Permissions) > 0
+	patchCodes := len(patch.Codes) > 0
+
+	if patchCodes == patchSet {
+		return ErrPatchCodeOrSet
+	}
+
+	toPatch, err := permissions.GetByID(instance, c.Param("permdocid"))
+	if err != nil {
+		return err
+	}
+
+	if patchCodes {
+		// a permission can be updated only by its parent
+		if !current.ParentOf(toPatch) {
+			return ErrForbidden
+		}
+		toPatch.PatchCodes(patch.Codes)
+	}
+
+	if patchSet {
+		// I can only add my own permissions to another permission doc
+		if !patch.Permissions.IsSubSetOf(current.Permissions) {
+			return ErrForbidden
+		}
+		toPatch.AddRules(patch.Permissions...)
+	}
+
+	if err = couchdb.UpdateDoc(instance, toPatch); err != nil {
+		return err
+	}
+
+	return jsonapi.Data(c, http.StatusOK, &apiPermission{toPatch}, nil)
+}
+
+func revokePermission(c echo.Context) error {
+	instance := middlewares.GetInstance(c)
+
+	current, err := GetPermission(c)
+	if err != nil {
+		return err
+	}
+
+	toRevoke, err := permissions.GetByID(instance, c.Param("permdocid"))
+	if err != nil {
+		return err
+	}
+
+	// a permission can be revoked only by its parent
+	if !current.ParentOf(toRevoke) {
+		return ErrForbidden
+	}
+
+	err = toRevoke.Revoke(instance)
+	if err != nil {
+		return err
+	}
+
+	return c.NoContent(http.StatusNoContent)
+
+}
+
+// Routes sets the routing for the permissions service
 func Routes(router *echo.Group) {
 	// API Routes
+	router.POST("", createPermission)
+	router.GET("/doctype/:doctype", listPermissionsByDoctype)
 	router.GET("/self", displayPermissions)
+	router.POST("/exists", listPermissions)
+	router.PATCH("/:permdocid", patchPermission)
+	router.DELETE("/:permdocid", revokePermission)
 }

@@ -5,9 +5,11 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/cozy/cozy-stack/pkg/consts"
 	"github.com/cozy/cozy-stack/pkg/couchdb"
 	"github.com/cozy/cozy-stack/web/jsonapi"
 	"github.com/cozy/cozy-stack/web/middlewares"
+	"github.com/cozy/cozy-stack/web/permissions"
 	"github.com/labstack/echo"
 )
 
@@ -15,12 +17,39 @@ func validDoctype(next echo.HandlerFunc) echo.HandlerFunc {
 	// TODO extends me to verificate characters allowed in db name.
 	return func(c echo.Context) error {
 		doctype := c.Param("doctype")
-		if doctype == "" && c.Path() != "/data/" {
+		if doctype == "" {
 			return jsonapi.NewError(http.StatusBadRequest, "Invalid doctype '%s'", doctype)
 		}
 		c.Set("doctype", doctype)
 		return next(c)
 	}
+}
+
+func fixErrorNoDatabaseIsWrongDoctype(err error) error {
+	if couchdb.IsNoDatabaseError(err) {
+		err.(*couchdb.Error).Reason = "wrong_doctype"
+	}
+	return err
+}
+
+func allDoctypes(c echo.Context) error {
+	instance := middlewares.GetInstance(c)
+
+	if err := permissions.AllowWholeType(c, permissions.GET, consts.Doctypes); err != nil {
+		return err
+	}
+
+	types, err := couchdb.AllDoctypes(instance)
+	if err != nil {
+		return err
+	}
+	var doctypes []string
+	for _, typ := range types {
+		if CheckReadable(typ) == nil {
+			doctypes = append(doctypes, typ)
+		}
+	}
+	return c.JSON(http.StatusOK, doctypes)
 }
 
 // GetDoc get a doc by its type and id
@@ -29,7 +58,7 @@ func getDoc(c echo.Context) error {
 	doctype := c.Get("doctype").(string)
 	docid := c.Param("docid")
 
-	if err := CheckReadable(c, doctype); err != nil {
+	if err := CheckReadable(doctype); err != nil {
 		return err
 	}
 
@@ -45,10 +74,15 @@ func getDoc(c echo.Context) error {
 	var out couchdb.JSONDoc
 	err := couchdb.GetDoc(instance, doctype, docid, &out)
 	if err != nil {
-		return err
+		return fixErrorNoDatabaseIsWrongDoctype(err)
 	}
 
 	out.Type = doctype
+
+	if err := permissions.Allow(c, permissions.GET, &out); err != nil {
+		return err
+	}
+
 	return c.JSON(http.StatusOK, out.ToMapWithType())
 }
 
@@ -62,7 +96,11 @@ func createDoc(c echo.Context) error {
 		return jsonapi.NewError(http.StatusBadRequest, err)
 	}
 
-	if err := CheckWritable(c, doctype); err != nil {
+	if err := CheckWritable(doctype); err != nil {
+		return err
+	}
+
+	if err := permissions.Allow(c, permissions.POST, &doc); err != nil {
 		return err
 	}
 
@@ -71,6 +109,28 @@ func createDoc(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusCreated, echo.Map{
+		"ok":   true,
+		"id":   doc.ID(),
+		"rev":  doc.Rev(),
+		"type": doc.DocType(),
+		"data": doc.ToMapWithType(),
+	})
+}
+
+func createNamedDoc(c echo.Context, doc couchdb.JSONDoc) error {
+	instance := middlewares.GetInstance(c)
+
+	err := permissions.Allow(c, permissions.POST, &doc)
+	if err != nil {
+		return err
+	}
+
+	err = couchdb.CreateNamedDoc(instance, doc)
+	if err != nil {
+		return fixErrorNoDatabaseIsWrongDoctype(err)
+	}
+
+	return c.JSON(http.StatusOK, echo.Map{
 		"ok":   true,
 		"id":   doc.ID(),
 		"rev":  doc.Rev(),
@@ -89,29 +149,50 @@ func updateDoc(c echo.Context) error {
 
 	doc.Type = c.Param("doctype")
 
-	if err := CheckWritable(c, doc.Type); err != nil {
+	if err := CheckWritable(doc.Type); err != nil {
 		return err
 	}
 
 	if (doc.ID() == "") != (doc.Rev() == "") {
 		return jsonapi.NewError(http.StatusBadRequest,
-			"You must either provide an _id and _rev in document (update) or neither (create with  fixed id).")
+			"You must either provide an _id and _rev in document (update) or neither (create with fixed id).")
 	}
 
 	if doc.ID() != "" && doc.ID() != c.Param("docid") {
 		return jsonapi.NewError(http.StatusBadRequest, "document _id doesnt match url")
 	}
 
-	var err error
 	if doc.ID() == "" {
 		doc.SetID(c.Param("docid"))
-		err = couchdb.CreateNamedDoc(instance, doc)
-	} else {
-		err = couchdb.UpdateDoc(instance, doc)
+		return createNamedDoc(c, doc)
 	}
 
-	if err != nil {
-		return err
+	errWhole := permissions.AllowWholeType(c, permissions.PUT, doc.DocType())
+	if errWhole != nil {
+
+		// we cant apply to whole type, let's fetch old doc and see if it applies there
+		var old couchdb.JSONDoc
+		errFetch := couchdb.GetDoc(instance, doc.DocType(), doc.ID(), &old)
+		if errFetch != nil {
+			return errFetch
+		}
+		old.Type = doc.DocType()
+		// check if permissions set allows manipulating old doc
+		errOld := permissions.Allow(c, permissions.PUT, &old)
+		if errOld != nil {
+			return errOld
+		}
+
+		// also check if permissions set allows manipulating new doc
+		errNew := permissions.Allow(c, permissions.PUT, &doc)
+		if errNew != nil {
+			return errNew
+		}
+	}
+
+	errUpdate := couchdb.UpdateDoc(instance, doc)
+	if errUpdate != nil {
+		return fixErrorNoDatabaseIsWrongDoctype(errUpdate)
 	}
 
 	return c.JSON(http.StatusOK, echo.Map{
@@ -142,20 +223,33 @@ func deleteDoc(c echo.Context) error {
 		return jsonapi.NewError(http.StatusBadRequest, "delete without revision")
 	}
 
-	if err := CheckWritable(c, doctype); err != nil {
+	if err := CheckWritable(doctype); err != nil {
 		return err
 	}
 
-	tombrev, err := couchdb.Delete(instance, doctype, docid, rev)
+	var doc couchdb.JSONDoc
+	err := couchdb.GetDoc(instance, doctype, docid, &doc)
+	if err != nil {
+		return err
+	}
+	doc.Type = doctype
+	doc.SetRev(rev)
+
+	err = permissions.Allow(c, permissions.DELETE, &doc)
 	if err != nil {
 		return err
 	}
 
+	err = couchdb.DeleteDoc(instance, &doc)
+	if err != nil {
+		return fixErrorNoDatabaseIsWrongDoctype(err)
+	}
+
 	return c.JSON(http.StatusOK, echo.Map{
 		"ok":      true,
-		"id":      docid,
-		"rev":     tombrev,
-		"type":    doctype,
+		"id":      doc.ID(),
+		"rev":     doc.Rev(),
+		"type":    doc.DocType(),
 		"deleted": true,
 	})
 
@@ -170,7 +264,11 @@ func defineIndex(c echo.Context) error {
 		return jsonapi.NewError(http.StatusBadRequest, err)
 	}
 
-	if err := CheckReadable(c, doctype); err != nil {
+	if err := CheckReadable(doctype); err != nil {
+		return err
+	}
+
+	if err := permissions.AllowWholeType(c, permissions.GET, doctype); err != nil {
 		return err
 	}
 
@@ -187,6 +285,8 @@ func defineIndex(c echo.Context) error {
 	return c.JSON(http.StatusOK, result)
 }
 
+const maxMangoLimit = 100
+
 func findDocuments(c echo.Context) error {
 	instance := middlewares.GetInstance(c)
 	doctype := c.Get("doctype").(string)
@@ -196,9 +296,21 @@ func findDocuments(c echo.Context) error {
 		return jsonapi.NewError(http.StatusBadRequest, err)
 	}
 
-	if err := CheckReadable(c, doctype); err != nil {
+	if err := CheckReadable(doctype); err != nil {
 		return err
 	}
+
+	if err := permissions.AllowWholeType(c, permissions.GET, doctype); err != nil {
+		return err
+	}
+
+	limit, hasLimit := findRequest["limit"].(float64)
+	if !hasLimit || limit > maxMangoLimit {
+		limit = 100
+	}
+
+	// add 1 so we know if there is more.
+	findRequest["limit"] = limit + 1
 
 	var results []couchdb.JSONDoc
 	err := couchdb.FindDocsRaw(instance, doctype, &findRequest, &results)
@@ -206,7 +318,17 @@ func findDocuments(c echo.Context) error {
 		return err
 	}
 
-	return c.JSON(http.StatusOK, echo.Map{"docs": results})
+	out := echo.Map{
+		"docs":  results,
+		"limit": limit,
+		"next":  false,
+	}
+	if len(results) > int(limit) {
+		out["docs"] = results[:len(results)-1]
+		out["next"] = true
+	}
+
+	return c.JSON(http.StatusOK, out)
 }
 
 var allowedChangesParams = map[string]bool{
@@ -216,10 +338,12 @@ var allowedChangesParams = map[string]bool{
 	"limit":     true,
 	"timeout":   true,
 	"heartbeat": true, // Pouchdb sends heartbeet even for non-continuous
+	"_nonce":    true, // Pouchdb sends a request hash to avoid agressive caching by some browsers
 }
 
 func changesFeed(c echo.Context) error {
 	instance := middlewares.GetInstance(c)
+	var doctype = c.Get("doctype").(string)
 
 	// Drop a clear error for parameters not supported by stack
 	for key := range c.QueryParams() {
@@ -246,8 +370,12 @@ func changesFeed(c echo.Context) error {
 		}
 	}
 
+	if err = permissions.AllowWholeType(c, permissions.GET, doctype); err != nil {
+		return err
+	}
+
 	results, err := couchdb.GetChanges(instance, &couchdb.ChangesRequest{
-		DocType: c.Get("doctype").(string),
+		DocType: doctype,
 		Feed:    feed,
 		Style:   feedStyle,
 		Since:   c.QueryParam("since"),
@@ -264,11 +392,22 @@ func changesFeed(c echo.Context) error {
 func allDocs(c echo.Context) error {
 	doctype := c.Get("doctype").(string)
 
-	if err := CheckReadable(c, doctype); err != nil {
+	if err := CheckReadable(doctype); err != nil {
+		return err
+	}
+
+	if err := permissions.AllowWholeType(c, permissions.GET, doctype); err != nil {
 		return err
 	}
 
 	return proxy(c, "_all_docs")
+}
+
+// mostly just to prevent couchdb crash on replications
+func dataAPIWelcome(c echo.Context) error {
+	return c.JSON(http.StatusOK, echo.Map{
+		"message": "welcome to a cozy API",
+	})
 }
 
 func couchdbStyleErrorHandler(next echo.HandlerFunc) echo.HandlerFunc {
@@ -298,20 +437,27 @@ func couchdbStyleErrorHandler(next echo.HandlerFunc) echo.HandlerFunc {
 
 // Routes sets the routing for the status service
 func Routes(router *echo.Group) {
-	router.Use(validDoctype)
 	router.Use(couchdbStyleErrorHandler)
 
-	replicationRoutes(router)
+	// API Routes that don't depend on a doctype
+	router.GET("/", dataAPIWelcome)
+	router.GET("/_all_doctypes", allDoctypes)
 
-	// API Routes
-	router.GET("/:doctype/:docid", getDoc)
-	router.PUT("/:doctype/:docid", updateDoc)
-	router.DELETE("/:doctype/:docid", deleteDoc)
-	router.POST("/:doctype/:docid/relationships/references", addReferencesHandler)
-	router.POST("/:doctype/", createDoc)
-	router.GET("/:doctype/_all_docs", allDocs)
-	router.POST("/:doctype/_all_docs", allDocs)
-	router.POST("/:doctype/_index", defineIndex)
-	router.POST("/:doctype/_find", findDocuments)
-	// router.DELETE("/:doctype/:docid", DeleteDoc)
+	group := router.Group("/:doctype", validDoctype)
+
+	replicationRoutes(group)
+
+	// API Routes under /:doctype
+	group.GET("/:docid", getDoc)
+	group.PUT("/:docid", updateDoc)
+	group.DELETE("/:docid", deleteDoc)
+	group.GET("/:docid/relationships/references", listReferencesHandler)
+	group.POST("/:docid/relationships/references", addReferencesHandler)
+	group.DELETE("/:docid/relationships/references", removeReferencesHandler)
+	group.POST("/", createDoc)
+	group.GET("/_all_docs", allDocs)
+	group.POST("/_all_docs", allDocs)
+	group.POST("/_index", defineIndex)
+	group.POST("/_find", findDocuments)
+	// group.DELETE("/:docid", DeleteDoc)
 }

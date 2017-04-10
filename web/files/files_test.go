@@ -14,27 +14,31 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/cozy/checkup"
 	"github.com/cozy/cozy-stack/pkg/config"
 	"github.com/cozy/cozy-stack/pkg/consts"
 	"github.com/cozy/cozy-stack/pkg/instance"
 	"github.com/cozy/cozy-stack/pkg/vfs"
-	"github.com/cozy/cozy-stack/web/errors"
+	"github.com/cozy/cozy-stack/tests/testutils"
 	"github.com/labstack/echo"
-	"github.com/spf13/afero"
 	"github.com/stretchr/testify/assert"
 )
 
 var ts *httptest.Server
 var testInstance *instance.Instance
+var token string
+var clientID string
 
-func injectInstance(i *instance.Instance) echo.MiddlewareFunc {
-	return func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
-			c.Set("instance", i)
-			return next(c)
-		}
+func readFile(fs vfs.VFS, name string) ([]byte, error) {
+	doc, err := fs.FileByPath(name)
+	if err != nil {
+		return nil, err
 	}
+	f, err := fs.OpenFile(doc)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return ioutil.ReadAll(f)
 }
 
 func extractJSONRes(res *http.Response, mp *map[string]interface{}) error {
@@ -45,7 +49,13 @@ func extractJSONRes(res *http.Response, mp *map[string]interface{}) error {
 }
 
 func createDir(t *testing.T, path string) (res *http.Response, v map[string]interface{}) {
-	res, err := http.Post(ts.URL+path, "text/plain", strings.NewReader(""))
+	req, err := http.NewRequest("POST", ts.URL+path, strings.NewReader(""))
+	if !assert.NoError(t, err) {
+		return
+	}
+	req.Header.Add("Content-Type", "text/plain")
+	req.Header.Add(echo.HeaderAuthorization, "Bearer "+token)
+	res, err = http.DefaultClient.Do(req)
 	if !assert.NoError(t, err) {
 		return
 	}
@@ -84,6 +94,7 @@ func doUploadOrMod(t *testing.T, req *http.Request, contentType, hash string) (r
 func upload(t *testing.T, path, contentType, body, hash string) (res *http.Response, v map[string]interface{}) {
 	buf := strings.NewReader(body)
 	req, err := http.NewRequest("POST", ts.URL+path, buf)
+	req.Header.Add(echo.HeaderAuthorization, "Bearer "+token)
 	if !assert.NoError(t, err) {
 		return
 	}
@@ -93,6 +104,7 @@ func upload(t *testing.T, path, contentType, body, hash string) (res *http.Respo
 func uploadMod(t *testing.T, path, contentType, body, hash string) (res *http.Response, v map[string]interface{}) {
 	buf := strings.NewReader(body)
 	req, err := http.NewRequest("PUT", ts.URL+path, buf)
+	req.Header.Add(echo.HeaderAuthorization, "Bearer "+token)
 	if !assert.NoError(t, err) {
 		return
 	}
@@ -101,6 +113,7 @@ func uploadMod(t *testing.T, path, contentType, body, hash string) (res *http.Re
 
 func trash(t *testing.T, path string) (res *http.Response, v map[string]interface{}) {
 	req, err := http.NewRequest(http.MethodDelete, ts.URL+path, nil)
+	req.Header.Add(echo.HeaderAuthorization, "Bearer "+token)
 	if !assert.NoError(t, err) {
 		return
 	}
@@ -118,6 +131,7 @@ func trash(t *testing.T, path string) (res *http.Response, v map[string]interfac
 
 func restore(t *testing.T, path string) (res *http.Response, v map[string]interface{}) {
 	req, err := http.NewRequest(http.MethodPost, ts.URL+path, nil)
+	req.Header.Add(echo.HeaderAuthorization, "Bearer "+token)
 	if !assert.NoError(t, err) {
 		return
 	}
@@ -181,6 +195,7 @@ func patchFile(t *testing.T, path, docType, id string, attrs map[string]interfac
 	}
 
 	req, err := http.NewRequest("PATCH", ts.URL+path, bytes.NewReader(b))
+	req.Header.Add(echo.HeaderAuthorization, "Bearer "+token)
 	if !assert.NoError(t, err) {
 		return
 	}
@@ -200,6 +215,7 @@ func patchFile(t *testing.T, path, docType, id string, attrs map[string]interfac
 
 func download(t *testing.T, path, byteRange string) (res *http.Response, body []byte) {
 	req, err := http.NewRequest("GET", ts.URL+path, nil)
+	req.Header.Add(echo.HeaderAuthorization, "Bearer "+token)
 	if !assert.NoError(t, err) {
 		return
 	}
@@ -248,10 +264,29 @@ func TestCreateDirRootSuccess(t *testing.T) {
 	res, _ := createDir(t, "/files/?Name=coucou&Type=directory")
 	assert.Equal(t, 201, res.StatusCode)
 
-	storage := testInstance.FS()
-	exists, err := afero.DirExists(storage, "/coucou")
+	storage := testInstance.VFS()
+	exists, err := vfs.DirExists(storage, "/coucou")
 	assert.NoError(t, err)
 	assert.True(t, exists)
+}
+
+func TestCreateDirWithDateSuccess(t *testing.T) {
+	req, _ := http.NewRequest("POST", ts.URL+"/files/?Type=directory&Name=dir-with-date", strings.NewReader(""))
+	req.Header.Add(echo.HeaderAuthorization, "Bearer "+token)
+	req.Header.Add("Date", "Mon, 19 Sep 2016 12:35:08 GMT")
+	res, err := http.DefaultClient.Do(req)
+	assert.NoError(t, err)
+	assert.Equal(t, 201, res.StatusCode)
+
+	var obj map[string]interface{}
+	err = extractJSONRes(res, &obj)
+	assert.NoError(t, err)
+	data := obj["data"].(map[string]interface{})
+	attrs := data["attributes"].(map[string]interface{})
+	createdAt := attrs["created_at"].(string)
+	assert.Equal(t, "2016-09-19T12:35:08Z", createdAt)
+	updatedAt := attrs["updated_at"].(string)
+	assert.Equal(t, createdAt, updatedAt)
 }
 
 func TestCreateDirWithParentSuccess(t *testing.T) {
@@ -268,8 +303,8 @@ func TestCreateDirWithParentSuccess(t *testing.T) {
 	res2, _ := createDir(t, "/files/"+parentID+"?Name=child&Type=directory")
 	assert.Equal(t, 201, res2.StatusCode)
 
-	storage := testInstance.FS()
-	exists, err := afero.DirExists(storage, "/dirparent/child")
+	storage := testInstance.VFS()
+	exists, err := vfs.DirExists(storage, "/dirparent/child")
 	assert.NoError(t, err)
 	assert.True(t, exists)
 }
@@ -329,8 +364,8 @@ func TestUploadBadHash(t *testing.T) {
 	res, _ := upload(t, "/files/?Type=file&Name=badhash", "text/plain", body, "3FbbMXfH+PdjAlWFfVb1dQ==")
 	assert.Equal(t, 412, res.StatusCode)
 
-	storage := testInstance.FS()
-	_, err := afero.ReadFile(storage, "/badhash")
+	storage := testInstance.VFS()
+	_, err := readFile(storage, "/badhash")
 	assert.Error(t, err)
 }
 
@@ -339,8 +374,8 @@ func TestUploadAtRootSuccess(t *testing.T) {
 	res, _ := upload(t, "/files/?Type=file&Name=goodhash", "text/plain", body, "rL0Y20zC+Fzt72VPzMSk2A==")
 	assert.Equal(t, 201, res.StatusCode)
 
-	storage := testInstance.FS()
-	buf, err := afero.ReadFile(storage, "/goodhash")
+	storage := testInstance.VFS()
+	buf, err := readFile(storage, "/goodhash")
 	assert.NoError(t, err)
 	assert.Equal(t, body, string(buf))
 }
@@ -392,8 +427,8 @@ func TestUploadWithParentSuccess(t *testing.T) {
 	res2, _ := upload(t, "/files/"+parentID+"?Type=file&Name=goodhash", "text/plain", body, "rL0Y20zC+Fzt72VPzMSk2A==")
 	assert.Equal(t, 201, res2.StatusCode)
 
-	storage := testInstance.FS()
-	buf, err := afero.ReadFile(storage, "/fileparent/goodhash")
+	storage := testInstance.VFS()
+	buf, err := readFile(storage, "/fileparent/goodhash")
 	assert.NoError(t, err)
 	assert.Equal(t, body, string(buf))
 }
@@ -428,19 +463,35 @@ func TestUploadWithParentAlreadyExists(t *testing.T) {
 func TestUploadWithDate(t *testing.T) {
 	buf := strings.NewReader("foo")
 	req, err := http.NewRequest("POST", ts.URL+"/files/?Type=file&Name=withcdate", buf)
+	req.Header.Add(echo.HeaderAuthorization, "Bearer "+token)
 	assert.NoError(t, err)
 	req.Header.Add("Date", "Mon, 19 Sep 2016 12:38:04 GMT")
 	res, obj := doUploadOrMod(t, req, "text/plain", "rL0Y20zC+Fzt72VPzMSk2A==")
 	assert.Equal(t, 201, res.StatusCode)
-	fmt.Printf("obj = %#v\n", obj)
 	data := obj["data"].(map[string]interface{})
-	fmt.Printf("data = %#v\n", data)
 	attrs := data["attributes"].(map[string]interface{})
-	fmt.Printf("attrs = %#v\n", attrs)
 	createdAt := attrs["created_at"].(string)
 	assert.Equal(t, "2016-09-19T12:38:04Z", createdAt)
 	updatedAt := attrs["updated_at"].(string)
 	assert.Equal(t, createdAt, updatedAt)
+}
+
+func TestUploadImage(t *testing.T) {
+	f, err := os.Open("../../tests/fixtures/wet-cozy_20160910__©M4Dz.jpg")
+	assert.NoError(t, err)
+	defer f.Close()
+	req, err := http.NewRequest("POST", ts.URL+"/files/?Type=file&Name=wet.jpg", f)
+	assert.NoError(t, err)
+	req.Header.Add(echo.HeaderAuthorization, "Bearer "+token)
+	res, obj := doUploadOrMod(t, req, "image/jpeg", "tHWYYuXBBflJ8wXgJ2c2yg==")
+	assert.Equal(t, 201, res.StatusCode)
+	data := obj["data"].(map[string]interface{})
+	attrs := data["attributes"].(map[string]interface{})
+	meta := attrs["metadata"].(map[string]interface{})
+	v := meta["extractor_version"].(float64)
+	assert.Equal(t, float64(vfs.MetadataExtractorVersion), v)
+	flash := meta["flash"].(string)
+	assert.Equal(t, "Off, Did not fire", flash)
 }
 
 func TestModifyMetadataFileMove(t *testing.T) {
@@ -533,8 +584,8 @@ func TestModifyMetadataDirMove(t *testing.T) {
 	res3, _ := patchFile(t, "/files/"+dir1ID, "directory", dir1ID, attrs1, nil)
 	assert.Equal(t, 200, res3.StatusCode)
 
-	storage := testInstance.FS()
-	exists, err := afero.DirExists(storage, "/dirmodmemoveinme/renamed")
+	storage := testInstance.VFS()
+	exists, err := vfs.DirExists(storage, "/dirmodmemoveinme/renamed")
 	assert.NoError(t, err)
 	assert.True(t, exists)
 
@@ -580,8 +631,8 @@ func TestModifyMetadataDirMoveWithRel(t *testing.T) {
 	res3, _ := patchFile(t, "/files/"+dir1ID, "directory", dir1ID, nil, parent)
 	assert.Equal(t, 200, res3.StatusCode)
 
-	storage := testInstance.FS()
-	exists, err := afero.DirExists(storage, "/dirmodmemoveinmewithrel/dirmodmewithrel")
+	storage := testInstance.VFS()
+	exists, err := vfs.DirExists(storage, "/dirmodmemoveinmewithrel/dirmodmewithrel")
 	assert.NoError(t, err)
 	assert.True(t, exists)
 }
@@ -628,6 +679,7 @@ func TestModifyContentBadRev(t *testing.T) {
 	newcontent := "newcontent :)"
 
 	req2, err := http.NewRequest("PUT", ts.URL+"/files/"+fileID, strings.NewReader(newcontent))
+	req2.Header.Add(echo.HeaderAuthorization, "Bearer "+token)
 	assert.NoError(t, err)
 
 	req2.Header.Add("If-Match", "badrev")
@@ -635,6 +687,7 @@ func TestModifyContentBadRev(t *testing.T) {
 	assert.Equal(t, 412, res2.StatusCode)
 
 	req3, err := http.NewRequest("PUT", ts.URL+"/files/"+fileID, strings.NewReader(newcontent))
+	req3.Header.Add(echo.HeaderAuthorization, "Bearer "+token)
 	assert.NoError(t, err)
 
 	req3.Header.Add("If-Match", fileRev)
@@ -647,14 +700,14 @@ func TestModifyContentSuccess(t *testing.T) {
 	var buf []byte
 	var fileInfo os.FileInfo
 
-	storage := testInstance.FS()
+	storage := testInstance.VFS()
 	res1, data1 := upload(t, "/files/?Type=file&Name=willbemodified&Executable=true", "text/plain", "foo", "")
 	assert.Equal(t, 201, res1.StatusCode)
 
-	buf, err = afero.ReadFile(storage, "/willbemodified")
+	buf, err = readFile(storage, "/willbemodified")
 	assert.NoError(t, err)
 	assert.Equal(t, "foo", string(buf))
-	fileInfo, err = storage.Stat("/willbemodified")
+	fileInfo, err = storage.FileByPath("/willbemodified")
 	assert.NoError(t, err)
 	assert.Equal(t, fileInfo.Mode().String(), "-rwxr-xr-x")
 
@@ -706,12 +759,29 @@ func TestModifyContentSuccess(t *testing.T) {
 	assert.Equal(t, attrs2["mime"], "audio/mp3")
 	assert.Equal(t, attrs2["executable"], false)
 
-	buf, err = afero.ReadFile(storage, "/willbemodified")
+	buf, err = readFile(storage, "/willbemodified")
 	assert.NoError(t, err)
 	assert.Equal(t, newcontent, string(buf))
-	fileInfo, err = storage.Stat("/willbemodified")
+	fileInfo, err = storage.FileByPath("/willbemodified")
 	assert.NoError(t, err)
 	assert.Equal(t, fileInfo.Mode().String(), "-rw-r--r--")
+
+	req, err := http.NewRequest("PUT", ts.URL+"/files/"+fileID, strings.NewReader(""))
+	assert.NoError(t, err)
+
+	req.Header.Add("Date", "Mon, 02 Jan 2006 15:04:05 MST")
+	req.Header.Add(echo.HeaderAuthorization, "Bearer "+token)
+
+	res3, data3 := doUploadOrMod(t, req, "what/ever", "")
+	assert.Equal(t, 200, res3.StatusCode)
+
+	data3, ok = data3["data"].(map[string]interface{})
+	assert.True(t, ok)
+
+	attrs3, ok := data3["attributes"].(map[string]interface{})
+	assert.True(t, ok)
+
+	assert.Equal(t, "2006-01-02T15:04:05Z", attrs3["updated_at"])
 }
 
 func TestModifyContentConcurrently(t *testing.T) {
@@ -771,8 +841,8 @@ func TestModifyContentConcurrently(t *testing.T) {
 		assert.True(t, strings.HasPrefix(s.rev, strconv.Itoa(i+2)+"-"))
 	}
 
-	storage := testInstance.FS()
-	buf, err := afero.ReadFile(storage, "/willbemodifiedconcurrently")
+	storage := testInstance.VFS()
+	buf, err := readFile(storage, "/willbemodifiedconcurrently")
 	assert.NoError(t, err)
 
 	found := false
@@ -824,7 +894,7 @@ func TestDownloadFileByPathSuccess(t *testing.T) {
 	res1, _ := upload(t, "/files/?Type=file&Name=downloadme2", "text/plain", body, "rL0Y20zC+Fzt72VPzMSk2A==")
 	assert.Equal(t, 201, res1.StatusCode)
 
-	res2, resbody := download(t, "/files/download?Path="+url.QueryEscape("/downloadme2"), "")
+	res2, resbody := download(t, "/files/download?Dl=1&Path="+url.QueryEscape("/downloadme2"), "")
 	assert.Equal(t, 200, res2.StatusCode)
 	assert.True(t, strings.HasPrefix(res2.Header.Get("Content-Disposition"), "attachment"))
 	assert.True(t, strings.Contains(res2.Header.Get("Content-Disposition"), "filename=downloadme2"))
@@ -852,14 +922,14 @@ func TestDownloadRangeSuccess(t *testing.T) {
 }
 
 func TestGetFileMetadataFromPath(t *testing.T) {
-	res1, _ := http.Get(ts.URL + "/files/metadata?Path=/noooooop")
+	res1, _ := httpGet(ts.URL + "/files/metadata?Path=/noooooop")
 	assert.Equal(t, 404, res1.StatusCode)
 
 	body := "foo,bar"
 	res2, _ := upload(t, "/files/?Type=file&Name=getmetadata", "text/plain", body, "UmfjCVWct/albVkURcJJfg==")
 	assert.Equal(t, 201, res2.StatusCode)
 
-	res3, _ := http.Get(ts.URL + "/files/metadata?Path=/getmetadata")
+	res3, _ := httpGet(ts.URL + "/files/metadata?Path=/getmetadata")
 	assert.Equal(t, 200, res3.StatusCode)
 }
 
@@ -867,12 +937,12 @@ func TestGetDirMetadataFromPath(t *testing.T) {
 	res1, _ := createDir(t, "/files/?Name=getdirmeta&Type=directory")
 	assert.Equal(t, 201, res1.StatusCode)
 
-	res2, _ := http.Get(ts.URL + "/files/metadata?Path=/getdirmeta")
+	res2, _ := httpGet(ts.URL + "/files/metadata?Path=/getdirmeta")
 	assert.Equal(t, 200, res2.StatusCode)
 }
 
 func TestGetFileMetadataFromID(t *testing.T) {
-	res1, _ := http.Get(ts.URL + "/files/qsdqsd")
+	res1, _ := httpGet(ts.URL + "/files/qsdqsd")
 	assert.Equal(t, 404, res1.StatusCode)
 
 	body := "foo,bar"
@@ -881,7 +951,7 @@ func TestGetFileMetadataFromID(t *testing.T) {
 
 	fileID, _ := extractDirData(t, data2)
 
-	res3, _ := http.Get(ts.URL + "/files/" + fileID)
+	res3, _ := httpGet(ts.URL + "/files/" + fileID)
 	assert.Equal(t, 200, res3.StatusCode)
 }
 
@@ -897,7 +967,7 @@ func TestGetDirMetadataFromID(t *testing.T) {
 
 	fileID, _ := extractDirData(t, data2)
 
-	res3, _ := http.Get(ts.URL + "/files/" + fileID)
+	res3, _ := httpGet(ts.URL + "/files/" + fileID)
 	assert.Equal(t, 200, res3.StatusCode)
 }
 
@@ -907,7 +977,17 @@ func TestArchiveNoFiles(t *testing.T) {
 			"attributes": {}
 		}
 	}`)
-	res, err := http.Post(ts.URL+"/files/archive", "application/vnd.api+json", body)
+	req, err := http.NewRequest("POST", ts.URL+"/files/archive", body)
+	if !assert.NoError(t, err) {
+		return
+	}
+	req.Header.Add("Content-Type", "application/vnd.api+json")
+	req.Header.Add(echo.HeaderAuthorization, "Bearer "+token)
+	res, err := http.DefaultClient.Do(req)
+	if !assert.NoError(t, err) {
+		return
+	}
+
 	assert.NoError(t, err)
 	assert.Equal(t, 400, res.StatusCode)
 	msg, err := ioutil.ReadAll(res.Body)
@@ -943,15 +1023,13 @@ func TestArchiveDirectDownload(t *testing.T) {
 	}`)
 
 	req, err := http.NewRequest("POST", ts.URL+"/files/archive", body)
+	req.Header.Add(echo.HeaderAuthorization, "Bearer "+token)
 	req.Header.Add("Content-Type", "application/zip")
 	req.Header.Add("Accept", "application/zip")
 	assert.NoError(t, err)
 	res, err := http.DefaultClient.Do(req)
 	assert.NoError(t, err)
-	if !assert.Equal(t, 200, res.StatusCode) {
-		b, err2 := ioutil.ReadAll(res.Body)
-		fmt.Println(err2, string(b))
-	}
+	assert.Equal(t, 200, res.StatusCode)
 	assert.Equal(t, "application/zip", res.Header.Get("Content-Type"))
 
 }
@@ -982,7 +1060,17 @@ func TestArchiveCreateAndDownload(t *testing.T) {
 		}
 	}`)
 
-	res, err := http.Post(ts.URL+"/files/archive", "application/vnd.api+json", body)
+	req, err := http.NewRequest("POST", ts.URL+"/files/archive", body)
+	if !assert.NoError(t, err) {
+		return
+	}
+	req.Header.Add("Content-Type", "application/vnd.api+json")
+	req.Header.Add(echo.HeaderAuthorization, "Bearer "+token)
+	res, err := http.DefaultClient.Do(req)
+	if !assert.NoError(t, err) {
+		return
+	}
+
 	assert.NoError(t, err)
 	assert.Equal(t, 200, res.StatusCode)
 	var data map[string]interface{}
@@ -990,15 +1078,14 @@ func TestArchiveCreateAndDownload(t *testing.T) {
 	assert.NoError(t, err)
 
 	downloadURL := ts.URL + data["links"].(map[string]interface{})["related"].(string)
-	res2, err := http.Get(downloadURL)
+	res2, err := httpGet(downloadURL)
 	assert.NoError(t, err)
 	assert.Equal(t, 200, res2.StatusCode)
 	disposition := res2.Header.Get("Content-Disposition")
 	assert.Equal(t, `attachment; filename=archive.zip`, disposition)
 }
 
-func TestFileCreateAndDownload(t *testing.T) {
-
+func TestFileCreateAndDownloadByPath(t *testing.T) {
 	body := "foo,bar"
 	res1, _ := upload(t, "/files/?Type=file&Name=todownload2steps", "text/plain", body, "UmfjCVWct/albVkURcJJfg==")
 	if !assert.Equal(t, 201, res1.StatusCode) {
@@ -1007,20 +1094,69 @@ func TestFileCreateAndDownload(t *testing.T) {
 
 	path := "/todownload2steps"
 
-	res, err := http.Post(ts.URL+"/files/downloads?Path="+path, "", nil)
+	req, err := http.NewRequest("POST", ts.URL+"/files/downloads?Path="+path, nil)
+	if !assert.NoError(t, err) {
+		return
+	}
+	req.Header.Add("Content-Type", "")
+	req.Header.Add(echo.HeaderAuthorization, "Bearer "+token)
+	res, err := http.DefaultClient.Do(req)
+	if !assert.NoError(t, err) {
+		return
+	}
+
 	assert.NoError(t, err)
 	assert.Equal(t, 200, res.StatusCode)
 	var data map[string]interface{}
 	err = json.NewDecoder(res.Body).Decode(&data)
-	fmt.Println(&data, err)
 	assert.NoError(t, err)
 
-	downloadURL := ts.URL + data["links"].(map[string]interface{})["related"].(string)
-	res2, err := http.Get(downloadURL)
+	displayURL := ts.URL + data["links"].(map[string]interface{})["related"].(string)
+	res2, err := http.Get(displayURL)
 	assert.NoError(t, err)
 	assert.Equal(t, 200, res2.StatusCode)
 	disposition := res2.Header.Get("Content-Disposition")
+	assert.Equal(t, `inline; filename=todownload2steps`, disposition)
+
+	downloadURL := ts.URL + data["links"].(map[string]interface{})["related"].(string) + "?Dl=1"
+	res3, err := http.Get(downloadURL)
+	assert.NoError(t, err)
+	assert.Equal(t, 200, res3.StatusCode)
+	disposition = res3.Header.Get("Content-Disposition")
 	assert.Equal(t, `attachment; filename=todownload2steps`, disposition)
+}
+
+func TestFileCreateAndDownloadByID(t *testing.T) {
+	body := "foo,bar"
+	res1, v := upload(t, "/files/?Type=file&Name=todownload2stepsbis", "text/plain", body, "UmfjCVWct/albVkURcJJfg==")
+	if !assert.Equal(t, 201, res1.StatusCode) {
+		return
+	}
+	id := v["data"].(map[string]interface{})["id"].(string)
+
+	req, err := http.NewRequest("POST", ts.URL+"/files/downloads?Id="+id, nil)
+	if !assert.NoError(t, err) {
+		return
+	}
+	req.Header.Add("Content-Type", "")
+	req.Header.Add(echo.HeaderAuthorization, "Bearer "+token)
+	res, err := http.DefaultClient.Do(req)
+	if !assert.NoError(t, err) {
+		return
+	}
+
+	assert.NoError(t, err)
+	assert.Equal(t, 200, res.StatusCode)
+	var data map[string]interface{}
+	err = json.NewDecoder(res.Body).Decode(&data)
+	assert.NoError(t, err)
+
+	displayURL := ts.URL + data["links"].(map[string]interface{})["related"].(string)
+	res2, err := http.Get(displayURL)
+	assert.NoError(t, err)
+	assert.Equal(t, 200, res2.StatusCode)
+	disposition := res2.Header.Get("Content-Disposition")
+	assert.Equal(t, `inline; filename=todownload2stepsbis`, disposition)
 }
 
 func TestArchiveNotFound(t *testing.T) {
@@ -1035,16 +1171,17 @@ func TestArchiveNotFound(t *testing.T) {
 			}
 		}
 	}`)
-	res, err := http.Post(ts.URL+"/files/archive", "application/vnd.api+json", body)
-	assert.NoError(t, err)
-	var data map[string]interface{}
-	err = json.NewDecoder(res.Body).Decode(&data)
-	assert.NoError(t, err)
-
-	downloadURL := ts.URL + data["links"].(map[string]interface{})["related"].(string)
-	res2, err := http.Get(downloadURL)
-	assert.NoError(t, err)
-	assert.Equal(t, 404, res2.StatusCode)
+	req, err := http.NewRequest("POST", ts.URL+"/files/archive", body)
+	if !assert.NoError(t, err) {
+		return
+	}
+	req.Header.Add("Content-Type", "application/vnd.api+json")
+	req.Header.Add(echo.HeaderAuthorization, "Bearer "+token)
+	res, err := http.DefaultClient.Do(req)
+	if !assert.NoError(t, err) {
+		return
+	}
+	assert.Equal(t, 404, res.StatusCode)
 }
 
 func TestDirTrash(t *testing.T) {
@@ -1069,17 +1206,17 @@ func TestDirTrash(t *testing.T) {
 		return
 	}
 
-	res5, err := http.Get(ts.URL + "/files/" + dirID)
+	res5, err := httpGet(ts.URL + "/files/" + dirID)
 	if !assert.NoError(t, err) || !assert.Equal(t, 200, res5.StatusCode) {
 		return
 	}
 
-	res6, err := http.Get(ts.URL + "/files/download?Path=" + url.QueryEscape(vfs.TrashDirName+"/totrashdir/child1"))
+	res6, err := httpGet(ts.URL + "/files/download?Path=" + url.QueryEscape(vfs.TrashDirName+"/totrashdir/child1"))
 	if !assert.NoError(t, err) || !assert.Equal(t, 200, res6.StatusCode) {
 		return
 	}
 
-	res7, err := http.Get(ts.URL + "/files/download?Path=" + url.QueryEscape(vfs.TrashDirName+"/totrashdir/child2"))
+	res7, err := httpGet(ts.URL + "/files/download?Path=" + url.QueryEscape(vfs.TrashDirName+"/totrashdir/child2"))
 	if !assert.NoError(t, err) || !assert.Equal(t, 200, res7.StatusCode) {
 		return
 	}
@@ -1104,7 +1241,7 @@ func TestFileTrash(t *testing.T) {
 		return
 	}
 
-	res3, err := http.Get(ts.URL + "/files/download?Path=" + url.QueryEscape(vfs.TrashDirName+"/totrashfile"))
+	res3, err := httpGet(ts.URL + "/files/download?Path=" + url.QueryEscape(vfs.TrashDirName+"/totrashfile"))
 	if !assert.NoError(t, err) || !assert.Equal(t, 200, res3.StatusCode) {
 		return
 	}
@@ -1134,7 +1271,7 @@ func TestFileRestore(t *testing.T) {
 		return
 	}
 
-	res4, err := http.Get(ts.URL + "/files/download?Path=" + url.QueryEscape("/torestorefile"))
+	res4, err := httpGet(ts.URL + "/files/download?Path=" + url.QueryEscape("/torestorefile"))
 	if !assert.NoError(t, err) || !assert.Equal(t, 200, res4.StatusCode) {
 		return
 	}
@@ -1324,7 +1461,7 @@ func TestTrashList(t *testing.T) {
 		return
 	}
 
-	res5, err := http.Get(ts.URL + "/files/trash")
+	res5, err := httpGet(ts.URL + "/files/trash")
 	if !assert.NoError(t, err) {
 		return
 	}
@@ -1370,6 +1507,7 @@ func TestTrashClear(t *testing.T) {
 
 	path := "/files/trash"
 	req, err := http.NewRequest(http.MethodDelete, ts.URL+path, nil)
+	req.Header.Add(echo.HeaderAuthorization, "Bearer "+token)
 	if !assert.NoError(t, err) {
 		return
 	}
@@ -1379,7 +1517,7 @@ func TestTrashClear(t *testing.T) {
 		return
 	}
 
-	res5, err := http.Get(ts.URL + "/files/trash")
+	res5, err := httpGet(ts.URL + "/files/trash")
 	if !assert.NoError(t, err) {
 		return
 	}
@@ -1426,6 +1564,7 @@ func TestDestroyFile(t *testing.T) {
 
 	path := "/files/trash/" + fileID
 	req, err := http.NewRequest(http.MethodDelete, ts.URL+path, nil)
+	req.Header.Add(echo.HeaderAuthorization, "Bearer "+token)
 	if !assert.NoError(t, err) {
 		return
 	}
@@ -1435,7 +1574,7 @@ func TestDestroyFile(t *testing.T) {
 		return
 	}
 
-	res5, err := http.Get(ts.URL + "/files/trash")
+	res5, err := httpGet(ts.URL + "/files/trash")
 	if !assert.NoError(t, err) {
 		return
 	}
@@ -1455,6 +1594,7 @@ func TestDestroyFile(t *testing.T) {
 
 	path = "/files/trash/" + dirID
 	req, err = http.NewRequest(http.MethodDelete, ts.URL+path, nil)
+	req.Header.Add(echo.HeaderAuthorization, "Bearer "+token)
 	if !assert.NoError(t, err) {
 		return
 	}
@@ -1464,7 +1604,7 @@ func TestDestroyFile(t *testing.T) {
 		return
 	}
 
-	res5, err = http.Get(ts.URL + "/files/trash")
+	res5, err = httpGet(ts.URL + "/files/trash")
 	if !assert.NoError(t, err) {
 		return
 	}
@@ -1482,42 +1622,32 @@ func TestDestroyFile(t *testing.T) {
 
 func TestMain(m *testing.M) {
 	config.UseTestFile()
-
-	db, err := checkup.HTTPChecker{URL: config.CouchURL()}.Check()
-	if err != nil || db.Status() != checkup.Healthy {
-		fmt.Println("This test need couchdb to run.")
-		os.Exit(1)
-	}
+	testutils.NeedCouchdb()
+	setup := testutils.NewSetup(m, "files_test")
 
 	tempdir, err := ioutil.TempDir("", "cozy-stack")
 	if err != nil {
 		fmt.Println("Could not create temporary directory.")
 		os.Exit(1)
 	}
+	setup.AddCleanup(func() error { return os.RemoveAll(tempdir) })
 
 	config.GetConfig().Fs.URL = fmt.Sprintf("file://localhost%s", tempdir)
 
-	instance.Destroy("test-files")
-	testInstance, err = instance.Create(&instance.Options{
-		Domain: "test-files",
-		Locale: "en",
-	})
+	testInstance = setup.GetTestInstance()
+	client, tok := setup.GetTestClient(consts.Files)
+	clientID = client.ClientID
+	token = tok
+	ts = setup.GetTestServer("/files", Routes)
+
+	os.Exit(setup.Run())
+}
+
+func httpGet(url string) (*http.Response, error) {
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		fmt.Println("Could not create test instance.", err)
-		os.Exit(1)
+		return nil, err
 	}
-
-	handler := echo.New()
-	handler.HTTPErrorHandler = errors.ErrorHandler
-	handler.Use(injectInstance(testInstance))
-	Routes(handler.Group("/files"))
-
-	ts = httptest.NewServer(handler)
-
-	res := m.Run()
-	ts.Close()
-	instance.Destroy("test-files")
-	os.RemoveAll(tempdir)
-
-	os.Exit(res)
+	req.Header.Add(echo.HeaderAuthorization, "Bearer "+token)
+	return http.DefaultClient.Do(req)
 }

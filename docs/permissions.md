@@ -15,8 +15,8 @@ When the user installs a new client-side app, she is asked to accept an
 initial set of permissions for this app. This set of permissions is described
 in the manifest of the app.
 
-Later, the application can gain more permissions via the intents and optional
-permissions. See below for more details.
+Later, the application can gain more permissions via the [intents](intents.md)
+and optional permissions. See below for more details.
 
 When the authentified user access a client-side app, the app receives a token
 from the stack that can be used in later requests to the stack as a proof of
@@ -55,7 +55,7 @@ allow to access and modify any file or directory.
 Some known types:
 
 - `io.cozy.files`, for files and folder in the [VFS](files.md)
-- `io.cozy.manifests` and `io.cozy.applications`, for [apps](apps.md)
+- `io.cozy.apps`, for [apps](apps.md)
 - `io.cozy.settings`, for the [settings](settings.md)
 - `io.cozy.jobs` and `io.cozy.triggers`, for [jobs](jobs.md)
 - `io.cozy.oauth.clients`, to list and revoke [OAuth 2 clients](auth.md)
@@ -339,13 +339,13 @@ Content-Type: application/vnd.api+json
 
 Add permissions in this permissions set. It can be used in inter-apps context
 as a way to give another app the permission for some data. For example, the
-contact application can send a `pick-a-photo` intent to the photos application
+contact application can send a "_pick a photo_" intent to the photos application
 with its permission id, and the photos app can then let the user choose a
 photo and give the contacts application the permissions to use it.
 
 It can also be used to add or remove codes.
 
-#### Request
+#### Request to add / remove codes
 
 ```http
 PATCH /permissions/a340d5e0-d647-11e6-b66c-5fc9ce1e17c6 HTTP/1.1
@@ -363,6 +363,32 @@ Accept: application/vnd.api+json
     "attributes": {
       "codes": {
         "Yohyoo8BHahh1lie": "jane"
+      }
+    }
+  }
+}
+```
+
+#### Request to add permisisons
+
+```http
+PATCH /permissions/a340d5e0-d647-11e6-b66c-5fc9ce1e17c6 HTTP/1.1
+Host: cozy.example.net
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWV9.TJVA95OrM7E2cBab30RMHrHDcEfxjoYZgeFONFh7HgQ
+Content-Type: application/vnd.api+json
+Accept: application/vnd.api+json
+```
+
+```json
+{
+  "data": {
+    "id": "a340d5e0-d647-11e6-b66c-5fc9ce1e17c6",
+    "type": "io.cozy.permissions",
+    "permissions": {
+      "add-this": {
+        "type": "io.cozy.files",
+        "verbs": ["GET"],
+        "values": ["some-picture-id"]
       }
     }
   }
@@ -417,4 +443,110 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3O
 
 ```http
 HTTP/1.1 204 No Content
+```
+
+### GET /permissions/doctype/:doctype
+
+List permissions for a doctype
+
+#### Request
+
+```http
+GET /permissions/doctype/io.cozy.events HTTP/1.1
+Host: cozy.example.net
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWV9.TJVA95OrM7E2cBab30RMHrHDcEfxjoYZgeFONFh7HgQ
+Content-Type: application/vnd.api+json
+Accept: application/vnd.api+json
+```
+#### Reponse
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/vnd.api+json
+```
+
+```json
+{
+  "data": [
+    {
+      "type": "io.cozy.permissions",
+      "id": "c47f82396d09bfcd270343c5855b30a0",
+      "attributes": {
+        "type": "share",
+        "permissions": {
+          "rule0": {
+            "type": "io.cozy.events",
+            "verbs": ["PATCH", "DELETE"],
+            "values": ["c47f82396d09bfcd270343c5855b0eea"]
+          }
+        },
+        "codes": { "bob": "secret" }
+      },
+      "meta": { "rev": "1-d46b6358683b80c8d59fc55d6de54127" },
+      "links": { "self": "/permissions/c47f82396d09bfcd270343c5855b30a0" }
+    },
+    {
+      "type": "io.cozy.permissions",
+      "id": "c47f82396d09bfcd270343c5855b351a",
+      "attributes": {
+        "type": "share",
+        "permissions": {
+          "rule0": {
+            "type": "io.cozy.events",
+            "verbs": [ "GET" ],
+            "values": [ "c47f82396d09bfcd270343c5855b169b" ]
+          }
+        },
+        "codes": { "bob": "secret" }
+      },
+      "meta": { "rev": "1-920af658575a56e9e84685f1b09e5c23" },
+      "links": { "self": "/permissions/c47f82396d09bfcd270343c5855b351a" }
+    }
+  ]
+}
+```
+
+Permissions required : GET on whole type
+
+### POST /permissions/exists
+
+List permissions for some documents
+
+#### Request
+
+```http
+POST /permissions/exists HTTP/1.1
+Host: cozy.example.net
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWV9.TJVA95OrM7E2cBab30RMHrHDcEfxjoYZgeFONFh7HgQ
+Content-Type: application/vnd.api+json
+Accept: application/vnd.api+json
+```
+
+```json
+{
+  "data": [
+    { "type": "io.cozy.files", "id": "94375086-e2e2-11e6-81b9-5bc0b9dd4aa4" }
+    { "type": "io.cozy.files", "id": "4cfbd8be-8968-11e6-9708-ef55b7c20863" }
+    { "type": "io.cozy.files", "id": "a340d5e0-d647-11e6-b66c-5fc9ce1e17c6" }
+    { "type": "io.cozy.files", "id": "94375086-e2e2-11e6-81b9-5bc0b9dd4aa4" }
+  ]
+}
+```
+
+#### Reponse
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/vnd.api+json
+```
+
+```json
+{
+  "data": [
+    { "type": "io.cozy.files", "id": "94375086-e2e2-11e6-81b9-5bc0b9dd4aa4",
+      "verbs":["GET"] }
+    { "type": "io.cozy.files", "id": "a340d5e0-d647-11e6-b66c-5fc9ce1e17c6",
+      "verbs":["GET", "POST"] }
+  ]
+}
 ```

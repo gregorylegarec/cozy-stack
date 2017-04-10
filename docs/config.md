@@ -21,17 +21,20 @@ See the example to check what contains the configuration.
 ### Example
 
 You can see an example of configuration in the
-[cozy.dist.yaml](../cozy.dist.yaml) file at the root of this repository.
+[cozy.example.yaml](../cozy.example.yaml) file at the root of this repository.
 
 This example's values represent the default values of the configuration. The
 equivalent cli flag are also filled in.
 
 
-## Administration secrect
+## Administration secret
 
 To access to the administration API (the `/admin/*` routes), a secret passphrase should be stored in a `cozy-admin-passphrase`. This file should be in one of the configuration directories, along with the main config file.
 
 The passphrase is stored in a salted-hashed representation using scrypt. To generate this file, you can use the `cozy-stack config passwd [config directory]` command. This command will ask you for a passphrase and will create the `cozy-admin-passphrase` in the specified directory.
+
+You can use the `COZY_ADMIN_PASSWORD` env variable if you do not want to type
+the passphrase each time you call `cozy-stack`.
 
 ### Example
 

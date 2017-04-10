@@ -89,12 +89,28 @@ func (r Rule) SomeValue(predicate func(v string) bool) bool {
 	return false
 }
 
-// ValuesContain returns true if the value is in r.Values
-func (r Rule) ValuesContain(value string) bool {
+// ValuesValid returns true if any value statisfy the predicate
+func (r Rule) ValuesValid(o Validable) bool {
 	for _, v := range r.Values {
-		if v == value {
+		if o.Valid(r.Selector, v) {
 			return true
 		}
 	}
 	return false
+}
+
+// ValuesContain returns true if all the values are in r.Values
+func (r Rule) ValuesContain(values ...string) bool {
+	for _, value := range values {
+		valueOK := false
+		for _, v := range r.Values {
+			if v == value {
+				valueOK = true
+			}
+		}
+		if !valueOK {
+			return false
+		}
+	}
+	return true
 }

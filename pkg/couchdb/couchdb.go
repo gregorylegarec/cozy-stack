@@ -14,8 +14,14 @@ import (
 	log "github.com/Sirupsen/logrus"
 	"github.com/cozy/cozy-stack/pkg/config"
 	"github.com/cozy/cozy-stack/pkg/couchdb/mango"
+	"github.com/cozy/cozy-stack/pkg/realtime"
 	"github.com/google/go-querystring/query"
+	"github.com/labstack/echo"
 )
+
+// MaxString is the unicode character "\uFFFF", useful in query as
+// a upperbound for string.
+const MaxString = mango.MaxString
 
 // Doc is the interface that encapsulate a couchdb document, of any
 // serializable type. This interface defines method to set and get the
@@ -46,17 +52,23 @@ func SimpleDatabasePrefix(prefix string) Database {
 	return &simpleDB{prefix}
 }
 
+func rtevent(db Database, evtype string, doc realtime.Doc) {
+	realtime.InstanceHub(db.Prefix()).Publish(&realtime.Event{
+		Type: evtype,
+		Doc:  doc,
+	})
+}
+
 // GlobalDB is the prefix used for stack-scoped db
 var GlobalDB = SimpleDatabasePrefix("global")
 
 // View is the map/reduce thing in CouchDB
 type View struct {
-	Map    string `json:"map"`
-	Reduce string `json:"reduce,omitempty"`
+	Name    string `json:"-"`
+	Doctype string `json:"-"`
+	Map     string `json:"map"`
+	Reduce  string `json:"reduce,omitempty"`
 }
-
-// Views is a map of name/views
-type Views map[string]View
 
 // JSONDoc is a map representing a simple json object that implements
 // the Doc interface.
@@ -149,6 +161,10 @@ var couchdbClient = &http.Client{
 	Timeout: 5 * time.Second,
 }
 
+func unescapeCouchdbName(name string) string {
+	return strings.Replace(name, "-", ".", -1)
+}
+
 func escapeCouchdbName(name string) string {
 	name = strings.Replace(name, ".", "-", -1)
 	name = strings.Replace(name, ":", "-", -1)
@@ -235,17 +251,30 @@ func makeRequest(method, path string, reqbody interface{}, resbody interface{}) 
 	return err
 }
 
-func fixErrorNoDatabaseIsWrongDoctype(err error) error {
-	if IsNoDatabaseError(err) {
-		err.(*Error).Reason = "wrong_doctype"
-	}
-	return err
-}
-
-// DBStatus re
+// DBStatus responds with informations on the database: size, number of
+// documents, sequence numbers, etc.
 func DBStatus(db Database, doctype string) (*DBStatusResponse, error) {
 	var out DBStatusResponse
 	return &out, makeRequest("GET", makeDBName(db, doctype), nil, &out)
+}
+
+// AllDoctypes returns a list of all the doctypes that have a database
+// on a given instance
+func AllDoctypes(db Database) ([]string, error) {
+	var dbs []string
+	if err := makeRequest("GET", "/_all_dbs", nil, &dbs); err != nil {
+		return nil, err
+	}
+	prefix := escapeCouchdbName(db.Prefix())
+	var doctypes []string
+	for _, dbname := range dbs {
+		parts := strings.SplitAfter(dbname, "/")
+		if len(parts) == 2 && parts[0] == prefix {
+			doctype := unescapeCouchdbName(parts[1])
+			doctypes = append(doctypes, doctype)
+		}
+	}
+	return doctypes, nil
 }
 
 // GetDoc fetch a document by its docType and ID, out is filled with
@@ -256,11 +285,7 @@ func GetDoc(db Database, doctype, id string, out Doc) error {
 	if err != nil {
 		return err
 	}
-	err = makeRequest("GET", docURL(db, doctype, id), nil, out)
-	if err != nil {
-		return fixErrorNoDatabaseIsWrongDoctype(err)
-	}
-	return nil
+	return makeRequest("GET", docURL(db, doctype, id), nil, out)
 }
 
 // CreateDB creates the necessary database for a doctype
@@ -311,38 +336,25 @@ func ResetDB(db Database, doctype string) error {
 	return CreateDB(db, doctype)
 }
 
-// Delete destroy a document by its doctype and ID .
+// DeleteDoc deletes a struct implementing the couchb.Doc interface
 // If the document's current rev does not match the one passed,
 // a CouchdbError(409 conflict) will be returned.
-// This functions returns the tombstone revision as string
-func Delete(db Database, doctype, id, rev string) (string, error) {
-	var err error
-	id, err = validateDocID(id)
-	if err != nil {
-		return "", err
-	}
-	var res updateResponse
-	qs := url.Values{"rev": []string{rev}}
-	url := docURL(db, doctype, id) + "?" + qs.Encode()
-	err = makeRequest("DELETE", url, nil, &res)
-	if err != nil {
-		return "", fixErrorNoDatabaseIsWrongDoctype(err)
-	}
-	return res.Rev, nil
-}
-
-// DeleteDoc deletes a struct implementing the couchb.Doc interface
 // The document's SetRev will be called with tombstone revision
 func DeleteDoc(db Database, doc Doc) error {
 	id, err := validateDocID(doc.ID())
 	if err != nil {
 		return err
 	}
-	tombrev, err := Delete(db, doc.DocType(), id, doc.Rev())
+
+	var res updateResponse
+	qs := url.Values{"rev": []string{doc.Rev()}}
+	url := docURL(db, doc.DocType(), id) + "?" + qs.Encode()
+	err = makeRequest("DELETE", url, nil, &res)
 	if err != nil {
 		return err
 	}
-	doc.SetRev(tombrev)
+	doc.SetRev(res.Rev)
+	rtevent(db, realtime.EventDelete, doc)
 	return nil
 }
 
@@ -361,10 +373,11 @@ func UpdateDoc(db Database, doc Doc) error {
 	var res updateResponse
 	err = makeRequest("PUT", url, doc, &res)
 	if err != nil {
-		return fixErrorNoDatabaseIsWrongDoctype(err)
+		return err
 	}
 	doc.SetRev(res.Rev)
-	return err
+	rtevent(db, realtime.EventUpdate, doc)
+	return nil
 }
 
 // CreateNamedDoc persist a document with an ID.
@@ -384,17 +397,18 @@ func CreateNamedDoc(db Database, doc Doc) error {
 	var res updateResponse
 	err = makeRequest("PUT", url, doc, &res)
 	if err != nil {
-		return fixErrorNoDatabaseIsWrongDoctype(err)
+		return err
 	}
 	doc.SetRev(res.Rev)
-	return err
+	rtevent(db, realtime.EventCreate, doc)
+	return nil
 }
 
 // CreateNamedDocWithDB is equivalent to CreateNamedDoc but creates the database
 // if it does not exist
 func CreateNamedDocWithDB(db Database, doc Doc) error {
 	err := CreateNamedDoc(db, doc)
-	if coucherr, ok := err.(*Error); ok && coucherr.Reason == "wrong_doctype" {
+	if IsNoDatabaseError(err) {
 		err = CreateDB(db, doc.DocType())
 		if err != nil {
 			return err
@@ -411,7 +425,6 @@ func createDocOrDb(db Database, doc Doc, response interface{}) error {
 	if err == nil || !IsNoDatabaseError(err) {
 		return err
 	}
-
 	err = CreateDB(db, doctype)
 	if err == nil {
 		err = makeRequest("POST", dbname, doc, response)
@@ -439,40 +452,79 @@ func CreateDoc(db Database, doc Doc) error {
 
 	doc.SetID(res.ID)
 	doc.SetRev(res.Rev)
+	rtevent(db, realtime.EventCreate, doc)
 	return nil
 }
 
 // DefineViews creates a design doc with some views
-func DefineViews(db Database, doctype string, views Views) error {
-	url := makeDBName(db, doctype) + "/_design/" + doctype
-	doc := struct {
-		Lang  string `json:"language"`
-		Views Views  `json:"views"`
-	}{
-		"javascript",
-		views,
+func DefineViews(db Database, views []*View) error {
+	// group views by doctype
+	grouped := make(map[string]map[string]*View)
+	for _, v := range views {
+		g, ok := grouped[v.Doctype]
+		if !ok {
+			g = make(map[string]*View)
+			grouped[v.Doctype] = g
+		}
+		g[v.Name] = v
 	}
-	return makeRequest("PUT", url, &doc, nil)
+	for doctype, views := range grouped {
+		url := makeDBName(db, doctype) + "/_design/" + doctype
+		doc := struct {
+			Lang  string           `json:"language"`
+			Views map[string]*View `json:"views"`
+		}{
+			"javascript",
+			views,
+		}
+		err := makeRequest("PUT", url, &doc, nil)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ExecView executes the specified view function
-func ExecView(db Database, doctype, view string, results interface{}) error {
-	url := makeDBName(db, doctype) + "/_design/" + doctype + "/_view/" + view
-	return makeRequest("GET", url, nil, &results)
+func ExecView(db Database, view *View, req *ViewRequest, results interface{}) error {
+	viewurl := fmt.Sprintf("%s/_design/%s/_view/%s", makeDBName(db, view.Doctype), view.Doctype, view.Name)
+	// Keys request
+	if req.Keys != nil {
+		return makeRequest("POST", viewurl, req, &results)
+	}
+	v, err := req.Values()
+	if err != nil {
+		return err
+	}
+	viewurl += "?" + v.Encode()
+	return makeRequest("GET", viewurl, nil, &results)
 }
 
 // DefineIndex define the index on the doctype database
 // see query package on how to define an index
-func DefineIndex(db Database, doctype string, index mango.Index) error {
-	_, err := DefineIndexRaw(db, doctype, &index)
+func DefineIndex(db Database, index *mango.Index) error {
+	_, err := DefineIndexRaw(db, index.Doctype, index.Request)
 	return err
 }
 
 // DefineIndexRaw defines a index
 func DefineIndexRaw(db Database, doctype string, index interface{}) (*IndexCreationResponse, error) {
 	url := makeDBName(db, doctype) + "/_index"
-	var response IndexCreationResponse
-	return &response, makeRequest("POST", url, &index, &response)
+	response := &IndexCreationResponse{}
+	if err := makeRequest("POST", url, &index, &response); err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
+// DefineIndexes defines a list of indexes
+func DefineIndexes(db Database, indexes []*mango.Index) error {
+	for _, index := range indexes {
+		if err := DefineIndex(db, index); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // FindDocs returns all documents matching the passed FindRequest
@@ -540,6 +592,7 @@ func Proxy(db Database, doctype, path string) *httputil.ReverseProxy {
 	director := func(req *http.Request) {
 		req.URL.Scheme = couchurl.Scheme
 		req.URL.Host = couchurl.Host
+		req.Header.Del(echo.HeaderAuthorization) // drop stack auth
 		req.URL.RawPath = "/" + makeDBName(db, doctype) + "/" + path
 		req.URL.Path, _ = url.QueryUnescape(req.URL.RawPath)
 	}
@@ -606,12 +659,38 @@ type AllDocsResponse struct {
 	} `json:"rows"`
 }
 
+// ViewRequest are all params that can be passed to a view
+// It can be encoded either as a POST-json or a GET-url.
+type ViewRequest struct {
+	Key      interface{} `json:"key,omitempty" url:"key,omitempty"`
+	StartKey interface{} `json:"start_key,omitempty" url:"start_key,omitempty"`
+	EndKey   interface{} `json:"end_key,omitempty" url:"end_key,omitempty"`
+
+	StartKeyDocID string `json:"startkey_docid,omitempty" url:"startkey_docid,omitempty"`
+	EndKeyDocID   string `json:"endkey_docid,omitempty" url:"endkey_docid,omitempty"`
+
+	// Keys cannot be used in url mode
+	Keys []interface{} `json:"keys,omitempty" url:"-"`
+
+	Limit       int  `json:"limit,omitempty" url:"limit,omitempty"`
+	Skip        int  `json:"skip,omitempty" url:"skip,omitempty"`
+	Descending  bool `json:"descending,omitempty" url:"descending,omitempty"`
+	IncludeDocs bool `json:"include_docs,omitempty" url:"include_docs,omitempty"`
+
+	InclusiveEnd bool `json:"inclusive_end,omitempty" url:"inclusive_end,omitempty"`
+
+	Reduce     bool `json:"reduce" url:"reduce"`
+	GroupLevel int  `json:"group_level,omitempty" url:"group_level,omitempty"`
+}
+
 // ViewResponse is the response we receive when executing a view
 type ViewResponse struct {
-	Rows []struct {
-		ID    string `json:"id"`
-		Key   string `json:"key"`
-		Value int64  `json:"value"`
+	Total int `json:"total_rows"`
+	Rows  []struct {
+		ID    string           `json:"id"`
+		Key   interface{}      `json:"key"`
+		Value interface{}      `json:"value"`
+		Doc   *json.RawMessage `json:"doc"`
 	} `json:"rows"`
 }
 

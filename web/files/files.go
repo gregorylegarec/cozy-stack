@@ -15,11 +15,12 @@ import (
 	"time"
 
 	"github.com/cozy/cozy-stack/pkg/consts"
-	"github.com/cozy/cozy-stack/pkg/couchdb"
 	"github.com/cozy/cozy-stack/pkg/instance"
+	pkgperm "github.com/cozy/cozy-stack/pkg/permissions"
 	"github.com/cozy/cozy-stack/pkg/vfs"
 	"github.com/cozy/cozy-stack/web/jsonapi"
 	"github.com/cozy/cozy-stack/web/middlewares"
+	"github.com/cozy/cozy-stack/web/permissions"
 	"github.com/labstack/echo"
 )
 
@@ -29,13 +30,6 @@ const TagSeparator = ","
 // ErrDocTypeInvalid is used when the document type sent is not
 // recognized
 var ErrDocTypeInvalid = errors.New("Invalid document type")
-
-func hideFields(doc jsonapi.Object) jsonapi.Object {
-	if f, ok := doc.(*vfs.FileDoc); ok {
-		return f.HideFields()
-	}
-	return doc
-}
 
 // CreationHandler handle all POST requests on /files/:dir-id
 // aiming at creating a new document in the FS. Given the Type
@@ -47,9 +41,9 @@ func CreationHandler(c echo.Context) error {
 	var err error
 	switch c.QueryParam("Type") {
 	case consts.FileType:
-		doc, err = createFileHandler(c, instance)
+		doc, err = createFileHandler(c, instance.VFS())
 	case consts.DirType:
-		doc, err = createDirHandler(c, instance)
+		doc, err = createDirHandler(c, instance.VFS())
 	default:
 		err = ErrDocTypeInvalid
 	}
@@ -58,21 +52,26 @@ func CreationHandler(c echo.Context) error {
 		return wrapVfsError(err)
 	}
 
-	hideFields(doc)
 	return jsonapi.Data(c, http.StatusCreated, doc, nil)
 }
 
-func createFileHandler(c echo.Context, vfsC vfs.Context) (doc *vfs.FileDoc, err error) {
+func createFileHandler(c echo.Context, fs vfs.VFS) (f *file, err error) {
 	tags := strings.Split(c.QueryParam("Tags"), TagSeparator)
 
 	dirID := c.Param("dir-id")
 	name := c.QueryParam("Name")
+	var doc *vfs.FileDoc
 	doc, err = fileDocFromReq(c, name, dirID, tags)
 	if err != nil {
 		return
 	}
 
-	file, err := vfs.CreateFile(vfsC, doc, nil)
+	err = checkPerm(c, "POST", nil, doc)
+	if err != nil {
+		return
+	}
+
+	file, err := fs.CreateFile(doc, nil)
 	if err != nil {
 		return
 	}
@@ -84,32 +83,54 @@ func createFileHandler(c echo.Context, vfsC vfs.Context) (doc *vfs.FileDoc, err 
 	}()
 
 	_, err = io.Copy(file, c.Request().Body)
+	if err != nil {
+		return
+	}
+	f = newFile(doc)
 	return
 }
 
-func createDirHandler(c echo.Context, vfsC vfs.Context) (*vfs.DirDoc, error) {
+func createDirHandler(c echo.Context, fs vfs.VFS) (*dir, error) {
 	path := c.QueryParam("Path")
 	tags := strings.Split(c.QueryParam("Tags"), TagSeparator)
 
+	var doc *vfs.DirDoc
+	var err error
 	if path != "" {
 		if c.QueryParam("Recursive") == "true" {
-			return vfs.MkdirAll(vfsC, path, tags)
+			doc, err = vfs.MkdirAll(fs, path, tags)
+		} else {
+			doc, err = vfs.Mkdir(fs, path, tags)
 		}
-		return vfs.Mkdir(vfsC, path, tags)
+		if err != nil {
+			return nil, err
+		}
+		return newDir(doc), nil
 	}
 
 	dirID := c.Param("dir-id")
 	name := c.QueryParam("Name")
-	doc, err := vfs.NewDirDoc(name, dirID, tags, nil)
+	doc, err = vfs.NewDirDoc(fs, name, dirID, tags)
+	if err != nil {
+		return nil, err
+	}
+	if date := c.Request().Header.Get("Date"); date != "" {
+		if t, err2 := time.Parse(time.RFC1123, date); err2 == nil {
+			doc.CreatedAt = t
+			doc.UpdatedAt = t
+		}
+	}
+
+	err = checkPerm(c, "POST", doc, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	if err = vfs.CreateDir(vfsC, doc); err != nil {
+	if err = fs.CreateDir(doc); err != nil {
 		return nil, err
 	}
 
-	return doc, nil
+	return newDir(doc), nil
 }
 
 // OverwriteFileContentHandler handles PUT requests on /files/:file-id
@@ -119,14 +140,14 @@ func OverwriteFileContentHandler(c echo.Context) (err error) {
 	var olddoc *vfs.FileDoc
 	var newdoc *vfs.FileDoc
 
-	olddoc, err = vfs.GetFileDoc(instance, c.Param("file-id"))
+	olddoc, err = instance.VFS().FileByID(c.Param("file-id"))
 	if err != nil {
 		return wrapVfsError(err)
 	}
 
 	newdoc, err = fileDocFromReq(
 		c,
-		olddoc.Name,
+		olddoc.DocName,
 		olddoc.DirID,
 		olddoc.Tags,
 	)
@@ -140,7 +161,17 @@ func OverwriteFileContentHandler(c echo.Context) (err error) {
 		return wrapVfsError(err)
 	}
 
-	file, err := vfs.CreateFile(instance, newdoc, olddoc)
+	err = checkPerm(c, permissions.PUT, nil, olddoc)
+	if err != nil {
+		return
+	}
+
+	err = checkPerm(c, permissions.PUT, nil, newdoc)
+	if err != nil {
+		return
+	}
+
+	file, err := instance.VFS().CreateFile(newdoc, olddoc)
 	if err != nil {
 		return wrapVfsError(err)
 	}
@@ -153,7 +184,7 @@ func OverwriteFileContentHandler(c echo.Context) (err error) {
 			err = wrapVfsError(err)
 			return
 		}
-		err = jsonapi.Data(c, http.StatusOK, hideFields(newdoc), nil)
+		err = fileData(c, http.StatusOK, newdoc, nil)
 	}()
 
 	_, err = io.Copy(file, c.Request().Body)
@@ -171,7 +202,7 @@ func ModifyMetadataByIDHandler(c echo.Context) error {
 	}
 
 	instance := middlewares.GetInstance(c)
-	dir, file, err := vfs.GetDirOrFileDoc(instance, c.Param("file-id"), false)
+	dir, file, err := instance.VFS().DirOrFileByID(c.Param("file-id"))
 	if err != nil {
 		return wrapVfsError(err)
 	}
@@ -190,7 +221,7 @@ func ModifyMetadataByPathHandler(c echo.Context) error {
 	}
 
 	instance := middlewares.GetInstance(c)
-	dir, file, err := vfs.GetDirOrFileDocFromPath(instance, c.QueryParam("Path"), false)
+	dir, file, err := instance.VFS().DirOrFileByPath(c.QueryParam("Path"))
 	if err != nil {
 		return wrapVfsError(err)
 	}
@@ -218,31 +249,34 @@ func getPatch(c echo.Context) (*vfs.DocPatch, error) {
 }
 
 func applyPatch(c echo.Context, instance *instance.Instance, patch *vfs.DocPatch, dir *vfs.DirDoc, file *vfs.FileDoc) error {
-	var doc couchdb.Doc
+	var rev string
 	if dir != nil {
-		doc = dir
+		rev = dir.Rev()
 	} else {
-		doc = file
+		rev = file.Rev()
 	}
 
-	if err := checkIfMatch(c, doc.Rev()); err != nil {
+	if err := checkIfMatch(c, rev); err != nil {
 		return wrapVfsError(err)
 	}
 
-	var data jsonapi.Object
-	var err error
-	if fileDoc, ok := doc.(*vfs.FileDoc); ok {
-		data, err = vfs.ModifyFileMetadata(instance, fileDoc, patch)
-	} else if dirDoc, ok := doc.(*vfs.DirDoc); ok {
-		data, err = vfs.ModifyDirMetadata(instance, dirDoc, patch)
+	if err := checkPerm(c, permissions.PATCH, dir, file); err != nil {
+		return err
 	}
 
+	if dir != nil {
+		doc, err := vfs.ModifyDirMetadata(instance.VFS(), dir, patch)
+		if err != nil {
+			return wrapVfsError(err)
+		}
+		return dirData(c, http.StatusOK, doc)
+	}
+
+	doc, err := vfs.ModifyFileMetadata(instance.VFS(), file, patch)
 	if err != nil {
 		return wrapVfsError(err)
 	}
-
-	data = hideFields(data)
-	return jsonapi.Data(c, http.StatusOK, data, nil)
+	return fileData(c, http.StatusOK, doc, nil)
 }
 
 // ReadMetadataFromIDHandler handles all GET requests on /files/:file-
@@ -252,20 +286,19 @@ func ReadMetadataFromIDHandler(c echo.Context) error {
 
 	fileID := c.Param("file-id")
 
-	dir, file, err := vfs.GetDirOrFileDoc(instance, fileID, true)
+	dir, file, err := instance.VFS().DirOrFileByID(fileID)
 	if err != nil {
 		return wrapVfsError(err)
 	}
 
-	var data jsonapi.Object
-	if dir != nil {
-		data = dir
-	} else {
-		data = file
+	if err := checkPerm(c, permissions.GET, dir, file); err != nil {
+		return err
 	}
 
-	data = hideFields(data)
-	return jsonapi.Data(c, http.StatusOK, data, nil)
+	if dir != nil {
+		return dirData(c, http.StatusOK, dir)
+	}
+	return fileData(c, http.StatusOK, file, nil)
 }
 
 // ReadMetadataFromPathHandler handles all GET requests on
@@ -275,20 +308,19 @@ func ReadMetadataFromPathHandler(c echo.Context) error {
 
 	instance := middlewares.GetInstance(c)
 
-	dir, file, err := vfs.GetDirOrFileDocFromPath(instance, c.QueryParam("Path"), true)
+	dir, file, err := instance.VFS().DirOrFileByPath(c.QueryParam("Path"))
 	if err != nil {
 		return wrapVfsError(err)
 	}
 
-	var data jsonapi.Object
-	if dir != nil {
-		data = dir
-	} else {
-		data = file
+	if err := checkPerm(c, permissions.GET, dir, file); err != nil {
+		return err
 	}
 
-	data = hideFields(data)
-	return jsonapi.Data(c, http.StatusOK, data, nil)
+	if dir != nil {
+		return dirData(c, http.StatusOK, dir)
+	}
+	return fileData(c, http.StatusOK, file, nil)
 }
 
 // ReadFileContentFromIDHandler handles all GET requests on /files/:file-id
@@ -297,12 +329,21 @@ func ReadMetadataFromPathHandler(c echo.Context) error {
 func ReadFileContentFromIDHandler(c echo.Context) error {
 	instance := middlewares.GetInstance(c)
 
-	doc, err := vfs.GetFileDoc(instance, c.Param("file-id"))
+	doc, err := instance.VFS().FileByID(c.Param("file-id"))
 	if err != nil {
 		return wrapVfsError(err)
 	}
 
-	err = vfs.ServeFileContent(instance, doc, "inline", c.Request(), c.Response())
+	err = checkPerm(c, permissions.GET, nil, doc)
+	if err != nil {
+		return err
+	}
+
+	disposition := "inline"
+	if c.QueryParam("Dl") == "1" {
+		disposition = "attachment"
+	}
+	err = vfs.ServeFileContent(instance.VFS(), doc, disposition, c.Request(), c.Response())
 	if err != nil {
 		return wrapVfsError(err)
 	}
@@ -310,15 +351,26 @@ func ReadFileContentFromIDHandler(c echo.Context) error {
 	return nil
 }
 
-func sendFileFromPath(c echo.Context, path string) error {
+func sendFileFromPath(c echo.Context, path string, checkPermission bool) error {
 	instance := middlewares.GetInstance(c)
 
-	doc, err := vfs.GetFileDocFromPath(instance, path)
+	doc, err := instance.VFS().FileByPath(path)
 	if err != nil {
 		return wrapVfsError(err)
 	}
 
-	err = vfs.ServeFileContent(instance, doc, "attachment", c.Request(), c.Response())
+	if checkPermission {
+		err = permissions.Allow(c, "GET", doc)
+		if err != nil {
+			return err
+		}
+	}
+
+	disposition := "inline"
+	if c.QueryParam("Dl") == "1" {
+		disposition = "attachment"
+	}
+	err = vfs.ServeFileContent(instance.VFS(), doc, disposition, c.Request(), c.Response())
 	if err != nil {
 		return wrapVfsError(err)
 	}
@@ -330,7 +382,7 @@ func sendFileFromPath(c echo.Context, path string) error {
 // aiming at downloading a file given its path. It serves the file in in
 // attachment mode.
 func ReadFileContentFromPathHandler(c echo.Context) error {
-	return sendFileFromPath(c, c.QueryParam("Path"))
+	return sendFileFromPath(c, c.QueryParam("Path"), true)
 }
 
 // ArchiveDownloadCreateHandler handles requests to /files/archive and stores the
@@ -351,9 +403,21 @@ func ArchiveDownloadCreateHandler(c echo.Context) error {
 	}
 	instance := middlewares.GetInstance(c)
 
+	entries, err := archive.GetEntries(instance.VFS())
+	if err != nil {
+		return wrapVfsError(err)
+	}
+
+	for _, e := range entries {
+		err = checkPerm(c, permissions.GET, e.Dir, e.File)
+		if err != nil {
+			return err
+		}
+	}
+
 	// if accept header is application/zip, send the archive immediately
 	if c.Request().Header.Get("Accept") == "application/zip" {
-		return archive.Serve(instance, c.Response())
+		return archive.Serve(instance.VFS(), c.Response())
 	}
 
 	secret, err := vfs.GetStore(instance.Domain).AddArchive(archive)
@@ -368,19 +432,33 @@ func ArchiveDownloadCreateHandler(c echo.Context) error {
 		Related: "/files/archive/" + secret + "/" + fakeName + ".zip",
 	}
 
-	return jsonapi.Data(c, http.StatusOK, archive, links)
+	return jsonapi.Data(c, http.StatusOK, &apiArchive{archive}, links)
 }
 
 // FileDownloadCreateHandler stores the required path into a secret
 // usable for download handler below.
 func FileDownloadCreateHandler(c echo.Context) error {
-
 	instance := middlewares.GetInstance(c)
-	path := c.QueryParam("Path")
+	var doc *vfs.FileDoc
+	var err error
+	var path string
 
-	doc, err := vfs.GetFileDocFromPath(instance, path)
+	if path = c.QueryParam("Path"); path != "" {
+		if doc, err = instance.VFS().FileByPath(path); err != nil {
+			return wrapVfsError(err)
+		}
+	} else if id := c.QueryParam("Id"); id != "" {
+		if doc, err = instance.VFS().FileByID(id); err != nil {
+			return wrapVfsError(err)
+		}
+		if path, err = doc.Path(instance.VFS()); err != nil {
+			return wrapVfsError(err)
+		}
+	}
+
+	err = permissions.Allow(c, "GET", doc)
 	if err != nil {
-		return wrapVfsError(err)
+		return err
 	}
 
 	secret, err := vfs.GetStore(instance.Domain).AddFile(path)
@@ -389,10 +467,10 @@ func FileDownloadCreateHandler(c echo.Context) error {
 	}
 
 	links := &jsonapi.LinksList{
-		Related: "/files/downloads/" + secret + "/" + doc.Name,
+		Related: "/files/downloads/" + secret + "/" + doc.DocName,
 	}
 
-	return jsonapi.Data(c, http.StatusOK, doc, links)
+	return fileData(c, http.StatusOK, doc, links)
 }
 
 // ArchiveDownloadHandler handles requests to /files/archive/:secret/whatever.zip
@@ -405,9 +483,9 @@ func ArchiveDownloadHandler(c echo.Context) error {
 		return wrapVfsError(err)
 	}
 	if archive == nil {
-		return jsonapi.NewError(400, "Wrong download token")
+		return jsonapi.NewError(http.StatusBadRequest, "Wrong download token")
 	}
-	return archive.Serve(instance, c.Response())
+	return archive.Serve(instance.VFS(), c.Response())
 }
 
 // FileDownloadHandler send a file that have previously be defined
@@ -420,9 +498,9 @@ func FileDownloadHandler(c echo.Context) error {
 		return wrapVfsError(err)
 	}
 	if path == "" {
-		return jsonapi.NewError(400, "Wrong download token")
+		return jsonapi.NewError(http.StatusBadRequest, "Wrong download token")
 	}
-	return sendFileFromPath(c, path)
+	return sendFileFromPath(c, path, false)
 }
 
 // TrashHandler handles all DELETE requests on /files/:file-id and
@@ -433,24 +511,29 @@ func TrashHandler(c echo.Context) error {
 
 	fileID := c.Param("file-id")
 
-	dir, file, err := vfs.GetDirOrFileDoc(instance, fileID, true)
+	dir, file, err := instance.VFS().DirOrFileByID(fileID)
 	if err != nil {
 		return wrapVfsError(err)
 	}
 
-	var data jsonapi.Object
+	err = checkPerm(c, permissions.PUT, dir, file)
+	if err != nil {
+		return err
+	}
+
 	if dir != nil {
-		data, err = vfs.TrashDir(instance, dir)
-	} else {
-		data, err = vfs.TrashFile(instance, file)
+		doc, errt := vfs.TrashDir(instance.VFS(), dir)
+		if errt != nil {
+			return wrapVfsError(errt)
+		}
+		return dirData(c, http.StatusOK, doc)
 	}
 
-	if err != nil {
-		return wrapVfsError(err)
+	doc, errt := vfs.TrashFile(instance.VFS(), file)
+	if errt != nil {
+		return wrapVfsError(errt)
 	}
-
-	data = hideFields(data)
-	return jsonapi.Data(c, http.StatusOK, data, nil)
+	return fileData(c, http.StatusOK, doc, nil)
 }
 
 // ReadTrashFilesHandler handle GET requests on /files/trash and return the
@@ -458,12 +541,17 @@ func TrashHandler(c echo.Context) error {
 func ReadTrashFilesHandler(c echo.Context) error {
 	instance := middlewares.GetInstance(c)
 
-	trash, err := vfs.GetDirDoc(instance, consts.TrashDirID, true)
+	trash, err := instance.VFS().DirByID(consts.TrashDirID)
 	if err != nil {
 		return wrapVfsError(err)
 	}
 
-	return jsonapi.DataList(c, http.StatusOK, trash.Included(), nil)
+	err = checkPerm(c, permissions.GET, trash, nil)
+	if err != nil {
+		return err
+	}
+
+	return dirDataList(c, http.StatusOK, trash)
 }
 
 // RestoreTrashFileHandler handle POST requests on /files/trash/file-id and
@@ -473,35 +561,46 @@ func RestoreTrashFileHandler(c echo.Context) error {
 
 	fileID := c.Param("file-id")
 
-	dir, file, err := vfs.GetDirOrFileDoc(instance, fileID, true)
+	dir, file, err := instance.VFS().DirOrFileByID(fileID)
 	if err != nil {
 		return wrapVfsError(err)
 	}
 
-	var data jsonapi.Object
+	err = checkPerm(c, permissions.PUT, dir, file)
+	if err != nil {
+		return err
+	}
+
 	if dir != nil {
-		data, err = vfs.RestoreDir(instance, dir)
-	} else {
-		data, err = vfs.RestoreFile(instance, file)
+		doc, errt := vfs.RestoreDir(instance.VFS(), dir)
+		if errt != nil {
+			return wrapVfsError(errt)
+		}
+		return dirData(c, http.StatusOK, doc)
 	}
 
-	if err != nil {
-		return wrapVfsError(err)
+	doc, errt := vfs.RestoreFile(instance.VFS(), file)
+	if errt != nil {
+		return wrapVfsError(errt)
 	}
-
-	data = hideFields(data)
-	return jsonapi.Data(c, http.StatusOK, data, nil)
+	return fileData(c, http.StatusOK, doc, nil)
 }
 
 // ClearTrashHandler handles DELETE request to clear the trash
 func ClearTrashHandler(c echo.Context) error {
 	instance := middlewares.GetInstance(c)
 
-	trash, err := vfs.GetDirDoc(instance, consts.TrashDirID, true)
+	trash, err := instance.VFS().DirByID(consts.TrashDirID)
 	if err != nil {
 		return wrapVfsError(err)
 	}
-	err = vfs.DestroyDirContent(instance, trash)
+
+	err = checkPerm(c, permissions.DELETE, trash, nil)
+	if err != nil {
+		return err
+	}
+
+	err = instance.VFS().DestroyDirContent(trash)
 	if err != nil {
 		return wrapVfsError(err)
 	}
@@ -515,15 +614,20 @@ func DestroyFileHandler(c echo.Context) error {
 
 	fileID := c.Param("file-id")
 
-	dir, file, err := vfs.GetDirOrFileDoc(instance, fileID, true)
+	dir, file, err := instance.VFS().DirOrFileByID(fileID)
 	if err != nil {
 		return wrapVfsError(err)
 	}
 
+	err = checkPerm(c, permissions.DELETE, dir, file)
+	if err != nil {
+		return err
+	}
+
 	if dir != nil {
-		err = vfs.DestroyDirAndContent(instance, dir)
+		err = instance.VFS().DestroyDirAndContent(dir)
 	} else {
-		err = vfs.DestroyFile(instance, file)
+		err = instance.VFS().DestroyFile(file)
 	}
 	if err != nil {
 		return wrapVfsError(err)
@@ -556,6 +660,7 @@ func Routes(router *echo.Group) {
 	router.GET("/downloads/:secret/:fake-name", FileDownloadHandler)
 
 	router.POST("/:file-id/relationships/referenced_by", AddReferencedHandler)
+	router.DELETE("/:file-id/relationships/referenced_by", RemoveReferencedHandler)
 
 	router.GET("/trash", ReadTrashFilesHandler)
 	router.DELETE("/trash", ClearTrashHandler)
@@ -585,12 +690,11 @@ func wrapVfsError(err error) error {
 		return jsonapi.PreconditionFailed("Content-Length", err)
 	case vfs.ErrConflict:
 		return jsonapi.Conflict(err)
-	case vfs.ErrFileInTrash:
+	case vfs.ErrFileInTrash, vfs.ErrNonAbsolutePath,
+		vfs.ErrDirNotEmpty:
 		return jsonapi.BadRequest(err)
-	case vfs.ErrNonAbsolutePath:
-		return jsonapi.BadRequest(err)
-	case vfs.ErrDirNotEmpty:
-		return jsonapi.BadRequest(err)
+	case vfs.ErrFileTooBig:
+		return jsonapi.NewError(http.StatusRequestEntityTooLarge, err)
 	}
 	return err
 }
@@ -620,9 +724,15 @@ func fileDocFromReq(c echo.Context, name, dirID string, tags []string) (*vfs.Fil
 		}
 	}
 
-	executable := c.QueryParam("Executable") == "true"
+	var mime, class string
 	contentType := header.Get("Content-Type")
-	mime, class := vfs.ExtractMimeAndClass(contentType)
+	if contentType == "" {
+		mime, class = vfs.ExtractMimeAndClassFromFilename(name)
+	} else {
+		mime, class = vfs.ExtractMimeAndClass(contentType)
+	}
+
+	executable := c.QueryParam("Executable") == "true"
 	return vfs.NewFileDoc(
 		name,
 		dirID,
@@ -652,13 +762,21 @@ func checkIfMatch(c echo.Context, rev string) error {
 	return nil
 }
 
+func checkPerm(c echo.Context, v pkgperm.Verb, d *vfs.DirDoc, f *vfs.FileDoc) error {
+	if d != nil {
+		return permissions.AllowVFS(c, v, d)
+	}
+
+	return permissions.AllowVFS(c, v, f)
+}
+
 func parseMD5Hash(md5B64 string) ([]byte, error) {
 	// Encoded md5 hash in base64 should at least have 22 caracters in
 	// base64: 16*3/4 = 21+1/3
 	//
 	// The padding may add up to 2 characters (non useful). If we are
 	// out of these boundaries we know we don't have a good hash and we
-	// can bail immediatly.
+	// can bail immediately.
 	if len(md5B64) < 22 || len(md5B64) > 24 {
 		return nil, fmt.Errorf("Given Content-MD5 is invalid")
 	}

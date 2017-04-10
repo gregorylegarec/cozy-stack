@@ -4,8 +4,12 @@ package jsonapi
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 
+	"github.com/cozy/cozy-stack/pkg/couchdb"
 	"github.com/labstack/echo"
 )
 
@@ -22,31 +26,36 @@ type Document struct {
 	Included []interface{}    `json:"included,omitempty"`
 }
 
-// Data can be called to send an answer with a JSON-API document containing a
-// single object as data
-func Data(c echo.Context, statusCode int, o Object, links *LinksList) error {
+// WriteData can be called to write an answer with a JSON-API document
+// containing a single object as data into an io.Writer.
+func WriteData(w io.Writer, o Object, links *LinksList) error {
 	var included []interface{}
 	for _, o := range o.Included() {
 		data, err := MarshalObject(o)
 		if err != nil {
-			return InternalServerError(err)
+			return err
 		}
 		included = append(included, &data)
 	}
 	data, err := MarshalObject(o)
 	if err != nil {
-		return InternalServerError(err)
+		return err
 	}
 	doc := Document{
 		Data:     &data,
 		Links:    links,
 		Included: included,
 	}
+	return json.NewEncoder(w).Encode(doc)
+}
 
+// Data can be called to send an answer with a JSON-API document containing a
+// single object as data
+func Data(c echo.Context, statusCode int, o Object, links *LinksList) error {
 	resp := c.Response()
 	resp.Header().Set("Content-Type", ContentType)
 	resp.WriteHeader(statusCode)
-	return json.NewEncoder(resp).Encode(doc)
+	return WriteData(resp, o, links)
 }
 
 // DataList can be called to send an multiple-value answer with a
@@ -71,6 +80,23 @@ func DataList(c echo.Context, statusCode int, objs []Object, links *LinksList) e
 		Links: links,
 	}
 
+	resp := c.Response()
+	resp.Header().Set("Content-Type", ContentType)
+	resp.WriteHeader(statusCode)
+	return json.NewEncoder(resp).Encode(doc)
+}
+
+// DataRelations can be called to send a Relations page,
+// a list of ResourceIdentifier
+func DataRelations(c echo.Context, statusCode int, refs []couchdb.DocReference, links *LinksList) error {
+	data, err := json.Marshal(refs)
+	if err != nil {
+		return InternalServerError(err)
+	}
+	doc := Document{
+		Data:  (*json.RawMessage)(&data),
+		Links: links,
+	}
 	resp := c.Response()
 	resp.Header().Set("Content-Type", ContentType)
 	resp.WriteHeader(statusCode)
@@ -125,8 +151,8 @@ func Bind(req *http.Request, attrs interface{}) (*ObjectMarshalling, error) {
 }
 
 // BindRelations extracts a Relationships request ( a list of ResourceIdentifier)
-func BindRelations(req *http.Request) ([]ResourceIdentifier, error) {
-	var out []ResourceIdentifier
+func BindRelations(req *http.Request) ([]couchdb.DocReference, error) {
+	var out []couchdb.DocReference
 	decoder := json.NewDecoder(req.Body)
 	var doc *Document
 	if err := decoder.Decode(&doc); err != nil {
@@ -137,12 +163,70 @@ func BindRelations(req *http.Request) ([]ResourceIdentifier, error) {
 	}
 	// Attempt Unmarshaling either as ResourceIdentifier or []ResourceIdentifier
 	if err := json.Unmarshal(*doc.Data, &out); err != nil {
-		var ri ResourceIdentifier
+		var ri couchdb.DocReference
 		if err = json.Unmarshal(*doc.Data, &ri); err != nil {
 			return nil, err
 		}
-		out = []ResourceIdentifier{ri}
+		out = []couchdb.DocReference{ri}
 		return out, nil
 	}
+	return out, nil
+}
+
+// PaginationCursorToParams transforms a Cursor into url.Values
+// the url.Values contains only keys page[limit] & page[cursor]
+// if the cursor is Done, the values will be empty.
+func PaginationCursorToParams(cursor *couchdb.Cursor) (url.Values, error) {
+
+	v := url.Values{}
+
+	v.Set("page[limit]", strconv.Itoa(cursor.Limit))
+
+	if !cursor.Done {
+		cursorObj := []interface{}{cursor.NextKey, cursor.NextDocID}
+		cursorBytes, err := json.Marshal(cursorObj)
+		if err != nil {
+			return nil, err
+		}
+		v.Set("page[cursor]", string(cursorBytes))
+	}
+
+	return v, nil
+}
+
+// ExtractPaginationCursor creates a Cursor from context Query.
+func ExtractPaginationCursor(c echo.Context, defaultLimit int) (*couchdb.Cursor, error) {
+
+	var out = &couchdb.Cursor{
+		Limit: defaultLimit,
+	}
+
+	if cursor := c.QueryParam("page[cursor]"); cursor != "" {
+		var parts []interface{}
+		err := json.Unmarshal([]byte(cursor), &parts)
+		if err != nil {
+			return nil, NewError(http.StatusBadRequest, "bad json cursor %s", cursor)
+		}
+
+		if len(parts) != 2 {
+			return nil, NewError(http.StatusBadRequest, "bad cursor length %s", cursor)
+		}
+		var ok bool
+		out.NextKey = parts[0]
+		out.NextDocID, ok = parts[1].(string)
+		if !ok {
+			return nil, NewError(http.StatusBadRequest, "bad cursor id %s", cursor)
+		}
+
+	}
+
+	if limit := c.QueryParam("page[limit]"); limit != "" {
+		reqLimit, err := strconv.ParseInt(limit, 10, 32)
+		if err != nil {
+			return nil, NewError(http.StatusBadRequest, "page limit is not a number")
+		}
+		out.Limit = int(reqLimit)
+	}
+
 	return out, nil
 }

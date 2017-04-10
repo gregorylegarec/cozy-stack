@@ -3,11 +3,11 @@ package jobs
 import (
 	"time"
 
-	"github.com/cozy/cozy-stack/web/jsonapi"
+	"github.com/cozy/cozy-stack/pkg/consts"
 )
 
 // maxPastTriggerTime is the maximum duration in the past for which the at
-// triggers are executed immediatly instead of discarded.
+// triggers are executed immediately instead of discarded.
 var maxPastTriggerTime = 24 * time.Hour
 
 // AtTrigger implements the @at trigger type. It schedules a job at a specified
@@ -23,7 +23,7 @@ type AtTrigger struct {
 func NewAtTrigger(infos *TriggerInfos) (*AtTrigger, error) {
 	at, err := time.Parse(time.RFC3339, infos.Arguments)
 	if err != nil {
-		return nil, jsonapi.BadRequest(err)
+		return nil, ErrMalformedTrigger
 	}
 	return &AtTrigger{
 		at:   at,
@@ -32,12 +32,12 @@ func NewAtTrigger(infos *TriggerInfos) (*AtTrigger, error) {
 	}, nil
 }
 
-// NewInTrigger returns a new instance of InTrigger given the specified
-// options.
+// NewInTrigger returns a new instance of AtTrigger given the specified
+// options as @in.
 func NewInTrigger(infos *TriggerInfos) (*AtTrigger, error) {
 	d, err := time.ParseDuration(infos.Arguments)
 	if err != nil {
-		return nil, jsonapi.BadRequest(err)
+		return nil, ErrMalformedTrigger
 	}
 	at := time.Now().Add(d)
 	return &AtTrigger{
@@ -50,6 +50,25 @@ func NewInTrigger(infos *TriggerInfos) (*AtTrigger, error) {
 // Type implements the Type method of the Trigger interface.
 func (a *AtTrigger) Type() string {
 	return a.in.Type
+}
+
+// DocType implements the permissions.Validable interface
+func (a *AtTrigger) DocType() string {
+	return consts.Triggers
+}
+
+// ID implements the permissions.Validable interface
+func (a *AtTrigger) ID() string {
+	return ""
+}
+
+// Valid implements the permissions.Validable interface
+func (a *AtTrigger) Valid(key, value string) bool {
+	switch key {
+	case WorkerType:
+		return a.in.WorkerType == value
+	}
+	return false
 }
 
 // Schedule implements the Schedule method of the Trigger interface.
@@ -70,6 +89,7 @@ func (a *AtTrigger) Schedule() <-chan *JobRequest {
 		case <-time.After(-duration):
 			a.trigger(ch)
 		case <-a.done:
+			close(ch)
 		}
 	}()
 	return ch

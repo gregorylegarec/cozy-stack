@@ -200,12 +200,12 @@ func (t *task) nextDelay() (bool, time.Duration, time.Duration) {
 	// allowed to the task
 	timeout := c.Timeout
 	if execTime+timeout > c.MaxExecTime {
-		timeout = execTime - c.MaxExecTime
+		timeout = c.MaxExecTime - execTime
 	}
 
 	var nextDelay time.Duration
 	if t.execCount == 0 {
-		// on first execution, execute immediatly
+		// on first execution, execute immediately
 		nextDelay = 0
 	} else {
 		nextDelay = c.RetryDelay << (t.execCount - 1)
